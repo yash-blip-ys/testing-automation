@@ -1,0 +1,20 @@
+{
+  "site_name": "SauceLabs E-Commerce Practice Sandbox",
+  "portal_url": "https://www.saucedemo.com/",
+  "ai_context": "Select a product, add it to the shopping cart, navigate to the checkout page, fill out the required shipping details, and successfully complete the order confirmation.",
+  "credentials": {
+    "username": "standard_user",
+    "password": "secret_sauce"
+  },
+  "victory_conditions": {
+    "text_matches": ["thank you for your order", "checkout: complete", "order complete"],
+    "url_substrings": ["checkout-complete"]
+  },
+  "form_autofill": [
+    { "keywords": ["first", "name"], "value": "Yuvraj" },
+    { "keywords": ["last"], "value": "Singh" },
+    { "keywords": ["zip", "postal", "code"], "value": "462026" }
+  ],
+  "target_elements_query": "button, a, .shopping_cart_link, [role='button'], input[type='submit']"
+}
+  
