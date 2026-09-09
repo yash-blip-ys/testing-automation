@@ -74,7 +74,7 @@ An AI-powered autonomous web testing and pathfinding agent that uses directed st
 Before starting, ensure you have the following installed on your system:
 
 | Component | Minimum Version |  Purpose |
-|-----------|-----------------|----------|---------|
+|-----------|-----------------|----------|
 | Python | 3.11.x |  Core runtime (tested on 3.11.9) |
 | Ollama | Latest |  Local LLM inference server |
 | Llama 3.2 Model | (via Ollama) |  AI heuristic decision-making |
@@ -319,8 +319,8 @@ All site-specific settings are stored in **`sites_config.json`**. This file **mu
 
 ### Configuration Fields Explained
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
+| Field | Type | Description |
+|-------|------|----------|
 | `site_name` | string |  Human-readable name for reports |
 | `portal_url` | string |  Starting URL (entry point) |
 | `ai_context` | string |  Natural language goal description (passed to LLM heuristic) |
