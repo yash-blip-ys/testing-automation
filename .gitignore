@@ -1,16 +1,7 @@
-﻿venv311/
+﻿# Python Environment & Cache
+venv311/
 __pycache__/
 *.pyc
 
-# Test reports, coverage, and execution logs
-reports/
-test-reports/
-report.html
-*.html
-.pytest_cache/
-htmlcov/
-.coverage
-allure-results/
-allure-report/
-logs/
-*.log
+# Generated Scan Reports
+scan_report_*.md
