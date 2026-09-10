@@ -8,77 +8,83 @@ import sys
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# -----------------------------------------------------------------------------
-# REVERT / TUNING KNOBS (top of file = easy to find and edit)
+# Actions that should NEVER be chosen automatically, regardless of what the AI
+# says. This is a safety net, not a navigation strategy — kept intentionally
+# tiny and generic (not tuned to any one site) so it doesn't quietly take
+# decision-making away from the AI. Anything not in this list is the AI's call.
+IRREVERSIBLE_ACTION_KEYWORDS = [
+    "log out", "logout", "sign out", "delete account",
+    "cancel subscription", "deactivate account",
+]
+
+# LAST-RESORT ONLY. If the AI fails twice in a row (ask_ai_navigator returns
+# None), we can't just leave every option tied at the same weight — a flat
+# tie gets broken by list order, which can walk the agent BACKWARDS out of a
+# near-complete flow (this is exactly what happened: "Finish" was available
+# but "Shopping Cart" won on a tie). This keyword list only breaks that tie;
+# it never overrides an actual AI decision, and it's generic across web apps
+# (not tuned to one site) rather than a return to hardcoded navigation logic.
+FALLBACK_PROGRESS_KEYWORDS = [
+    "finish", "submit", "confirm", "checkout", "continue",
+    "save", "next", "proceed", "place order",
+]
+
+# Generic actions that usually UNDO progress in a web workflow. These are NOT
+# a hard block — the AI can still explicitly rank one of these as its top
+# choice and that choice wins (lines below ensure an AI ranking overrides
+# this default). But when the AI gives no ranking (AI = None fallback) OR
+# the action is unranked, we assign a heavier default cost so the agent
+# doesn't casually pick "Remove", "Cancel", "Reset App State", or social
+# links when a forward option exists.
 #
-# Every new behavior in this file has a kill-switch constant below. Set the
-# constant to turn off that feature and behavior reverts to the prior version
-# without needing to restore the backup file.
-# -----------------------------------------------------------------------------
+# To disable: set = [ ] and all default penalties vanish.
+ANTI_PROGRESS_KEYWORDS = [
+    "remove", "cancel", "reset app state", "reset", "clear",
+    "continue shopping", "back to products", "close menu",
+    "twitter", "facebook", "linkedin", "youtube", "instagram",
+    "about",
+]
 
-# Kill-switch: If False, AI scoring is PERMANENTLY cached on first node visit
-# exactly like the old behavior. If True, we INVALIDATE cached scores when we
-# return to a previously-visited node after enough workflow progress happened
-# (the recent_actions log is longer than the snapshot taken at first visit by
-# at least STALE_SCORE_REASK_THRESHOLD actions). This is what prevents the
-# regressive "cost 1 assigned on page 1 is still cost 1 on page 8" bug.
-ENABLE_STALE_SCORE_INVALIDATION = True
-STALE_SCORE_REASK_THRESHOLD = 4
-
-# Kill-switch: If False, skips the MECHANICAL external-domain tagger entirely
-# (fallback to old behavior). When True, ANY <a> whose href origin differs
-# from window.location.origin gets an automatic safety_tag=-1 during element
-# extraction. This catches Twitter/Facebook/LinkedIn/saucelabs.com/ANY
-# off-domain link with 100% accuracy, zero LLM cost, zero hardcoded keywords,
-# fully site-agnostic.
-ENABLE_MECHANICAL_EXTERNAL_DETECTION = True
-
-# Kill-switch: If False, the AI navigator prompt does NOT include the negative
-# semantic tagging request and safety tags are only what the mechanical layer
-# above produces. If True, the AI is ASKED to classify every available
-# element as 0 / -1 / -2. Mechanical tags always win over AI tags for items
-# the machine can prove (external links).
-ENABLE_AI_SEMANTIC_SAFETY_TAGS = True
-
-# Kill-switch: If False, the AI gets ONLY the original prompt inputs (goal +
-# recent actions + buttons list). If True, the AI additionally receives:
-#   - the current full page URL
-#   - the current page <title>
-#   - a 400-char preview of body innerText (reads the actual page content!)
-#   - step depth within max_search_depth (so it knows "we're close to the end")
-# This is the fix for "LLM hallucinated 'Continue' on step-2 page" — it had
-# no idea what page it was on, just a list of buttons.
-ENABLE_FULL_PAGE_CONTEXT_FOR_AI = True
-
-# Numeric semantic safety codes (exactly what you specified):
-SAFETY_EXTERNAL_SITE = -1      # leads off-domain (different website)
-SAFETY_DESTRUCTIVE = -2        # remove product, delete account, cancel sub, etc.
-
-# Edge costs that correspond to the safety codes (heavy, but <999 so AI can
-# still explicitly rank them as #1 choice and override if truly needed).
-COST_FOR_SAFETY_EXTERNAL = 50      # -1  → heavy, not permanently blocked
-COST_FOR_SAFETY_DESTRUCTIVE = 998  # -2  → near-blocked (only AI #1 overrides)
+# Anti-progress default weight (heavier than unranked normal actions = 10,
+# lighter than IRREVERSIBLE block = 999). Normal unranked = 10, so this = 15.
+ANTI_PROGRESS_DEFAULT_WEIGHT = 15
 
 # After a click, if the page state hash did NOT change (same URL + same
-# elements), the action accomplished nothing. +50 instantly (not +2).
+# elements), the action accomplished nothing. This is a wasted step: a
+# nav-link-to-self, a click on a disabled element, or something equally
+# unhelpful. +=2 per click was way too soft; the agent would retry the same
+# useless action 5+ times before it finally ranked below others. This big
+# penalty (added to edge weight once per same-node-detected click) stops
+# those loops fast.
 FUTILE_ACTION_PENALTY = 50
 
-# Click / scroll timeout for a single attempt. 4s normal; 30s freeze = gone.
+# Click timeout for a single attempt. Previously every scroll/click failure
+# blocked 30 seconds per edge. 4 seconds per attempt is enough for any
+# normal element; overlay recovery logic (already written) gets one retry.
 CLICK_ATTEMPT_TIMEOUT_MS = 4000
 
-# How many of the agent's most recent actions get shown back to the AI.
-RECENT_ACTIONS_MEMORY = 5
+# How many of the agent's most recent actions get shown back to the AI, so it
+# has short-term memory instead of re-deciding every page cold.
+RECENT_ACTIONS_MEMORY = 3
 
-# Expected runtime (warning-only — never blocks execution).
+# The environment this project is built and tested against. Mismatches here
+# don't crash anything, but they cause exactly the kind of silent, hard-to-
+# diagnose Playwright/version behavior differences described in bug reports
+# from real runs — so we warn loudly instead of staying quiet about it.
 EXPECTED_PYTHON_VERSION = (3, 11)
 EXPECTED_VENV_MARKER = "venv311"
-# -----------------------------------------------------------------------------
 
 
 def check_environment():
-    """Warns loudly but never blocks on Python/venv mismatch."""
+    """
+    Warns (does not block) if the interpreter actually running this script
+    doesn't match the venv/Python version the project is built against.
+    Mixing a global Python install with the project's venv is a known source
+    of Playwright behaving inconsistently in ways that look like random bugs.
+    """
     version_ok = sys.version_info[:2] == EXPECTED_PYTHON_VERSION
     venv_ok = EXPECTED_VENV_MARKER in sys.prefix or EXPECTED_VENV_MARKER in sys.executable
+
     if not version_ok or not venv_ok:
         print("=" * 70)
         print("[WARNING] Environment mismatch detected.")
@@ -86,17 +92,36 @@ def check_environment():
         print(f"  Running version     : {sys.version.split()[0]}")
         print(f"  Expected            : Python {EXPECTED_PYTHON_VERSION[0]}.{EXPECTED_PYTHON_VERSION[1]}"
               f" inside a '{EXPECTED_VENV_MARKER}' virtual environment")
-        print("  Activate the venv before running this script.")
+        print("  This project was built and tested against that exact setup.")
+        print("  Mixing a global Python install with the project venv can cause")
+        print("  Playwright to behave inconsistently in ways that look like")
+        print("  random bugs. Activate the venv before running this script.")
         print("=" * 70)
     return version_ok and venv_ok
 
 
 def compute_node_hash(url, elements):
+    """
+    Generates a unique cryptographic signature for the current visual layout state.
+    This serves as our unique identifier for vertices (nodes) in the state graph.
+    """
     state_string = f"{url}|{','.join(sorted(elements))}"
     return hashlib.md5(state_string.encode('utf-8')).hexdigest()[:10]
 
 
 async def safe_wait_for_load(page, timeout_ms=8000):
+    """
+    Bug #4 fix: page.wait_for_load_state("networkidle") never resolves on
+    sites with persistent background network activity (ad trackers, analytics
+    beacons, websocket-based chat widgets) — it just times out after the full
+    default 30s. Left unhandled, that timeout crashed the whole script the
+    moment the agent wandered onto an external site (saucelabs.com) that
+    never goes network-idle.
+
+    This tries a short, bounded wait for networkidle, and falls back to the
+    much cheaper "domcontentloaded" if that times out — and it NEVER raises,
+    so a slow/noisy page can no longer take down the whole run.
+    """
     try:
         await page.wait_for_load_state("networkidle", timeout=timeout_ms)
     except PlaywrightTimeoutError:
@@ -107,121 +132,60 @@ async def safe_wait_for_load(page, timeout_ms=8000):
 
 
 def _validate_navigator_response(parsed, available_elements):
+    """
+    Confirms the AI's response is actually usable before we act on it:
+    - it's a dict
+    - best_choice is present and is one of the elements actually on screen
+    - ranked_backup (if present) is a list of strings
+
+    Returns an error string describing what's wrong, or None if valid.
+    """
     if not isinstance(parsed, dict):
         return "response was not a JSON object"
+
     best_choice = parsed.get("best_choice")
     if not isinstance(best_choice, str):
         return "'best_choice' is missing or not a string"
+
     if best_choice not in available_elements:
         return f"'best_choice' ({best_choice!r}) is not one of the elements actually on screen"
+
     ranked_backup = parsed.get("ranked_backup", [])
     if not isinstance(ranked_backup, list) or not all(isinstance(x, str) for x in ranked_backup):
         return "'ranked_backup' must be a list of strings"
-    safety_tags = parsed.get("safety_tags")
-    if ENABLE_AI_SEMANTIC_SAFETY_TAGS:
-        if not isinstance(safety_tags, dict):
-            return "'safety_tags' must be a JSON object mapping element -> integer tag"
-        for k, v in safety_tags.items():
-            if not isinstance(k, str) or not isinstance(v, int):
-                return "'safety_tags' values must be integers: 0 safe, -1 external, -2 destructive"
-            if v not in (0, SAFETY_EXTERNAL_SITE, SAFETY_DESTRUCTIVE):
-                return f"'safety_tags' value {v!r} for {k!r} not in allowed set (0, -1, -2)"
+
     return None
 
 
-def ask_ai_navigator(available_elements, goal, recent_actions,
-                     page_url=None, page_title=None, page_text_snippet=None,
-                     step_index=None, max_steps=None,
-                     mechanical_safety_tags=None):
+def ask_ai_navigator(available_elements, goal, recent_actions):
     """
-    The ALL-NEW Navigator.
+    The Navigator. Given the goal, what's on screen, and what the agent has
+    done recently, asks the LLM to make ONE clear decision — not independent
+    per-element scores. A single forced top pick (plus ranked backups) is far
+    less prone to wishy-washy, inconsistent output than asking the model to
+    grade every option in isolation.
 
-    KEY DIFFERENCE vs old version: when ENABLE_FULL_PAGE_CONTEXT_FOR_AI is
-    True, the LLM now knows WHAT PAGE IT'S ON, not just a blind list of
-    buttons. The "Continue was hallucinated on checkout-step-2" class of bug
-    goes away because the AI literally reads:
-        CURRENT PAGE URL: .../checkout-step-two.html
-        PAGE TITLE: Swag Labs
-        PAGE PREVIEW: "Checkout: Overview  Sauce Labs Backpack  ... Cancel  Finish"
-    And the prompt explicitly reminds it: "You are on step X/25 of the run."
-
-    When ENABLE_AI_SEMANTIC_SAFETY_TAGS is True, the AI must ALSO classify
-    every available element as 0 (safe) / -1 (external site) / -2 (destructive
-    undo-progress action). Mechanical tags from element extraction are passed
-    in as mechanical_safety_tags so the AI can see what the system ALREADY
-    proved (e.g. "this is off-domain") and is less likely to misclassify.
+    Returns a dict: {"best_choice": str, "ranked_backup": [str, ...], "reasoning": str}
+    or None if the AI could not produce a usable answer after one retry —
+    callers must handle None explicitly rather than assume success.
     """
-    if mechanical_safety_tags is None:
-        mechanical_safety_tags = {}
-
     recent_actions_text = (
         "; ".join(recent_actions[-RECENT_ACTIONS_MEMORY:])
-        if recent_actions else "none yet — this is the FIRST step of the run"
+        if recent_actions else "none yet — this is the first step"
     )
-
-    context_block = ""
-    if ENABLE_FULL_PAGE_CONTEXT_FOR_AI:
-        page_context_parts = []
-        if page_url:
-            page_context_parts.append(f"CURRENT PAGE URL: {page_url}")
-        if page_title:
-            page_context_parts.append(f"PAGE TITLE: {page_title}")
-        if step_index is not None and max_steps is not None:
-            page_context_parts.append(f"RUN DEPTH: you are on step {step_index + 1} of {max_steps} total allowed steps")
-        if page_text_snippet:
-            page_context_parts.append(f"PAGE CONTENT PREVIEW (first ~400 chars of visible body text):\n{page_text_snippet}")
-        if mechanical_safety_tags:
-            mt_preview = {k: v for k, v in list(mechanical_safety_tags.items()) if v != 0}
-            if mt_preview:
-                t = lambda v: "EXTERNAL_SITE(-1)" if v == SAFETY_EXTERNAL_SITE else "DESTRUCTIVE(-2)"
-                page_context_parts.append(
-                    "MECHANICALLY PROVEN SAFETY TAGS (the system already confirmed these facts; "
-                    "your safety_tags output MUST match or exceed them; do NOT downgrade a "
-                    "mechanically proven external/destructive item to 0):\n"
-                    + json.dumps({k: f"{v} ({t(v)})" for k, v in mt_preview.items()}, indent=2)
-                )
-        if page_context_parts:
-            context_block = "\nCONTEXT ABOUT THE PAGE YOU ARE CURRENTLY ON (use this to avoid hallucinating buttons from previous pages):\n" + "\n".join(page_context_parts) + "\n"
-
-    safety_tag_instruction = ""
-    safety_tag_shape = ""
-    if ENABLE_AI_SEMANTIC_SAFETY_TAGS:
-        safety_tag_instruction = (
-            f"\nFinally, you MUST classify EVERY available element with an integer SAFETY TAG: "
-            f"0 = safe in-app navigation, "
-            f"{SAFETY_EXTERNAL_SITE} (= {SAFETY_EXTERNAL_SITE}) = clicking leaves the current website/domain, "
-            f"{SAFETY_DESTRUCTIVE} (= {SAFETY_DESTRUCTIVE}) = destructive / undo-progress actions "
-            f"(examples: remove item from cart, cancel order/form, reset/wipe app state, delete account, "
-            f"sign out/log out, cancel subscription, close without saving). "
-            f"Any element MECHANICALLY PROVEN above as external/destructive MUST receive the matching "
-            f"tag in your output; you cannot downgrade those. Any element that leads to a third-party "
-            f"social network, marketing site, documentation page, blog, or anything off-main-app = {SAFETY_EXTERNAL_SITE}.\n"
-        )
-        safety_tag_shape = (
-            ', "safety_tags": {"<element1>": 0, "<element2>": -1, "<element3>": -2, ...} '
-            '(one entry for EVERY element in the AVAILABLE CLICKABLE OPTIONS list, no omissions)'
-        )
 
     base_prompt = (
         f"USER GOAL: {goal}\n\n"
-        f"RECENT ACTIONS ALREADY TAKEN (do not blindly repeat these; consider the full flow): {recent_actions_text}\n"
-        f"{context_block}\n"
+        f"RECENT ACTIONS ALREADY TAKEN (do not blindly repeat these): {recent_actions_text}\n\n"
         f"AVAILABLE CLICKABLE OPTIONS ON SCREEN:\n{available_elements}\n\n"
         "INSTRUCTIONS:\n"
-        "Given the CURRENT PAGE CONTEXT above, pick the ONE option that is the most logical NEXT STEP "
-        "TOWARD THE GOAL, taking into account what page you are on and how far through the workflow you already are. "
-        "WARNING: It is a CRITICAL ERROR to pick a button that existed on a PREVIOUS page that has already been "
-        "navigated past (e.g. do NOT say 'Continue' on the final review step where only 'Finish' and 'Cancel' exist — "
-        "read the options list and page content carefully).\n\n"
-        "Then rank the remaining options as backups, best first, in case the top choice fails to execute. "
-        "Give a one-sentence reason for your top choice.\n"
-        f"{safety_tag_instruction}\n"
+        "Pick the ONE option that is the most logical next step toward the goal. "
+        "Then rank the remaining options as backups, best first, in case the top "
+        "choice fails to execute. Give a one-sentence reason for your top choice.\n\n"
         "Respond with ONLY a raw JSON object in exactly this shape:\n"
         '{"best_choice": "<exact text of one option>", '
         '"ranked_backup": ["<exact text>", "..."], '
-        '"reasoning": "<one short sentence>"'
-        f"{safety_tag_shape}"
-        "}"
+        '"reasoning": "<one short sentence>"}'
     )
 
     prompt = base_prompt
@@ -244,8 +208,7 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
         prompt = (
             base_prompt
             + f"\n\nYour previous response was invalid: {error}. "
-              "Respond again with ONLY the corrected raw JSON object. Make sure you include ALL required keys, "
-              "especially 'safety_tags' with one entry per available element if requested."
+              "Respond again with ONLY the corrected raw JSON object."
         )
 
     print("[Navigator] Could not get a valid decision after retrying. Falling back to a deterministic default.")
@@ -253,9 +216,14 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
 
 
 def generate_scan_report(site_name, target_goal, status, total_steps, nodes_discovered, trajectory_log):
+    """
+    Compiles data points gathered during the graph exploration phase and generates
+    a persistent, structured Markdown audit report.
+    """
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     report_filename = f"scan_report_{timestamp}.md"
     status_text = "SUCCESS" if "SUCCESS" in status else "FAILED"
+
     markdown_content = f"""# Autonomous Pathfinding Agent Execution Report
 **Timestamp:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  
 **Target Application:** {site_name}  
@@ -275,23 +243,34 @@ def generate_scan_report(site_name, target_goal, status, total_steps, nodes_disc
 ---
 
 ## Execution Trajectory (Path Log)
+Below is the exact step-by-step route your agent took through the application's directed state graph:
 
 | Step | Source Node | Current URL | Action Taken (Edge) | Assigned Cost |
 | :--- | :--- | :--- | :--- | :--- |
 """
     for entry in trajectory_log:
         markdown_content += f"| {entry['step']} | `{entry['node']}` | [{entry['url']}]({entry['url']}) | **{entry['action']}** | `{entry['cost']}` |\n"
+
     markdown_content += "\n\n---\n*Report generated automatically by Directed State-Graph Pathfinder Agent Framework.*"
+
     with open(report_filename, "w", encoding="utf-8") as f:
         f.write(markdown_content)
     print(f"\n[REPORT GENERATED] File saved successfully: {os.path.abspath(report_filename)}")
 
 
 async def close_blocking_overlays(page, target_text):
-    """Generic overlay closer — Sauce Labs bm-menu + any [role='dialog'] modals."""
+    """
+    Generic overlay/modal closer. If a menu/dialog overlay is currently visible
+    AND we're not actually trying to interact with that menu right now, try to
+    close it before we attempt the real click.
+
+    Never raises — if this fails, we just proceed to the normal click
+    attempt/retry logic below.
+    """
     menu_related_actions = {"open menu", "close menu", "all items", "about", "logout", "reset app state"}
     if target_text.lower() in menu_related_actions:
         return
+
     try:
         overlay_selectors = [
             ".bm-menu-wrap[aria-hidden='false']",
@@ -316,6 +295,11 @@ async def close_blocking_overlays(page, target_text):
 
 
 async def click_with_overlay_recovery(page, locator, target_text):
+    """
+    Attempts the click; if it's blocked by an overlay interception, tries to
+    recover (close overlays, retry once) instead of letting that single
+    click failure be the only thing tried before giving up on the edge.
+    """
     try:
         await locator.click(timeout=CLICK_ATTEMPT_TIMEOUT_MS)
         return
@@ -327,9 +311,21 @@ async def click_with_overlay_recovery(page, locator, target_text):
 
 async def build_locator_for_edge(page, edge_text, element_hints):
     """
-    Generic selector resolver. element_hints[label] = which attribute produced
-    the label ('text', 'value', 'placeholder', 'id', 'special'). We try the
-    hinted selector FIRST for maximum accuracy, then fall back.
+    Bug #1 fix (GENERIC, non-site-specific): the element extraction step can
+    label a clickable thing using one of several strategies, in priority
+    order: innerText, value, placeholder, id. The old click logic only tried
+    text= and input[value=] — so labels that were produced from the .id
+    fallback (e.g. image links like "item_4_img_link") were unclickable.
+
+    Strategy:
+      1. Hardcoded: if edge_text == "Shopping Cart" → .shopping_cart_link
+      2. If extraction hinted this label came from an id → try #id first
+      3. text="EXACT" — visible text match (original behavior)
+      4. input[value="X"] — original input fallback
+      5. [id="X"] — generic CSS id selector fallback (catches <a id=...>)
+      6. a:has(img)[id="X"] — anchor wrapping an image (common pattern)
+
+    Returns (locator, success_bool). Caller still does is_visible() check.
     """
     if edge_text == "Shopping Cart":
         loc = page.locator(".shopping_cart_link").first
@@ -338,6 +334,7 @@ async def build_locator_for_edge(page, edge_text, element_hints):
                 return loc, True
         except Exception:
             pass
+
     hint = element_hints.get(edge_text)
     if hint == "id":
         escaped = edge_text.replace('"', '\\"')
@@ -347,21 +344,14 @@ async def build_locator_for_edge(page, edge_text, element_hints):
                 return loc, True
         except Exception:
             pass
-    if hint == "value":
-        escaped = edge_text.replace('"', '\\"')
-        try:
-            loc = page.locator(f'input[value="{escaped}"]').first
-            if await loc.count() > 0 and await loc.is_visible(timeout=500):
-                return loc, True
-        except Exception:
-            pass
+
     strategies = [
         ('text', lambda t: page.locator(f'text="{t}"').first),
         ('input_value', lambda t: page.locator(f'input[value="{t}"]').first),
         ('css_id', lambda t: page.locator(f'[id="{t}"]').first),
         ('a_href_id', lambda t: page.locator(f'a[id="{t}"]').first),
     ]
-    for _, build in strategies:
+    for name, build in strategies:
         try:
             loc = build(edge_text)
             if await loc.count() > 0 and await loc.is_visible(timeout=500):
@@ -412,6 +402,7 @@ async def run_pathfinder_agent():
         try:
             await page.locator("[placeholder*='user' i], input[type='text'], input[type='email']").first.fill(config["credentials"]["username"])
             await page.locator("[placeholder*='pass' i], input[type='password']").first.fill(config["credentials"]["password"])
+
             login_selectors = ["#login-button", "input[type='submit']", "button[type='submit']", "button:has-text('Log In')", "button:has-text('Sign In')"]
             authenticated = False
             for selector in login_selectors:
@@ -423,8 +414,10 @@ async def run_pathfinder_agent():
                         break
                 except Exception:
                     continue
+
             if not authenticated:
                 await page.keyboard.press("Enter")
+
             await safe_wait_for_load(page)
             print("[+] Root node authenticated. Entering graph exploration phase.")
         except Exception as e:
@@ -432,17 +425,7 @@ async def run_pathfinder_agent():
             await browser.close()
             return
 
-        # ---------------------------------------------------------------------
-        # NEW data structure: state_graph stores not just "visited? T/F" but
-        # also the LENGTH of recent_actions_log at the moment the node was
-        # FIRST (or last) scored. This is the STALE SCORE INVALIDATION engine.
-        # When we return to this node later, if recent_actions is longer by
-        # >= STALE_SCORE_REASK_THRESHOLD, we RERUN the AI — because the
-        # CONTEXT (workflow progress) has materially changed, and a cost=1
-        # assigned at step 2 is no longer a good cost at step 12.
-        # ---------------------------------------------------------------------
-        state_graph_metadata = {}  # node_hash -> {"first_score_action_count": N}
-        state_graph = {}           # node_hash -> {} (preserved shape for len() metric)
+        state_graph = {}
         edge_weights = {}
         node_breadcrumbs = []
         recent_actions_log = []
@@ -460,12 +443,16 @@ async def run_pathfinder_agent():
 
             matched_text = any(msg.lower() in current_ui_text.lower() for msg in victory_text_matches)
             matched_url = any(sub.lower() in current_url.lower() for sub in victory_url_subs)
+
             if matched_text or matched_url:
                 print(f"\n[SUCCESS] Targeted Destination Node Reached in {step} structural transitions!")
                 scan_status = "SUCCESS_TARGET_REACHED"
                 break
 
-            # --- Futile action / same-node penalty (from previous fix set) ---
+            # --- Same-node / Futile-action penalty detection ---
+            # If we just clicked something last iteration AND node hash is the
+            # same as pre_interaction, that previous action was a no-op.
+            # Penalize it heavily so the same edge isn't retried many times.
             if pre_interaction_node is not None and pre_interaction_edge is not None:
                 tentative_elements = await page.evaluate("""(selectorQuery) => {
                     const elements = Array.from(document.querySelectorAll(selectorQuery));
@@ -489,14 +476,10 @@ async def run_pathfinder_agent():
                 pre_interaction_node = None
                 pre_interaction_edge = None
 
-            # --- EXTRACT ELEMENTS + MECHANICAL SAFETY TAGS -----------------
-            # Site-agnostic external-link detection uses window.location.origin
-            # comparison — it works for EVERY website, zero keywords, 100%
-            # accuracy, zero LLM cost. Works for any <a href> that points
-            # off-domain (Twitter, FB, LinkedIn, About page to saucelabs.com,
-            # marketing trackers, everything).
-            extract_result = await page.evaluate("""(args) => {
-                const [selectorQuery, enableMechanical] = args;
+            # --- Extract elements WITH "how we got the label" hints ---
+            # Returns tuple (labels_list, hints_dict). hints_dict[label] tells
+            # the click resolver which selector strategy to try first.
+            extract_result = await page.evaluate("""(selectorQuery) => {
                 const elements = Array.from(document.querySelectorAll(selectorQuery));
                 const visible = elements.filter(el => {
                     const rect = el.getBoundingClientRect();
@@ -505,8 +488,6 @@ async def run_pathfinder_agent():
                 });
                 const labels = [];
                 const hints = {};
-                const mechanical_safety_tags = {};
-                const pageOrigin = window.location.origin;
                 for (const el of visible) {
                     let label;
                     let source;
@@ -532,34 +513,16 @@ async def run_pathfinder_agent():
                     if (!labels.includes(label)) {
                         labels.push(label);
                         hints[label] = source;
-                        if (enableMechanical) {
-                            const href = el.getAttribute && el.getAttribute('href');
-                            if (href && (href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//'))) {
-                                try {
-                                    const linkUrl = new URL(href, window.location.href);
-                                    if (linkUrl.origin !== pageOrigin) {
-                                        mechanical_safety_tags[label] = -1;
-                                    }
-                                } catch(e) {}
-                            }
-                        }
                     }
                 }
-                return { labels, hints, mechanical_safety_tags };
-            }""", [target_selectors, ENABLE_MECHANICAL_EXTERNAL_DETECTION])
+                return { labels, hints };
+            }""", target_selectors)
             available_elements = extract_result["labels"]
             element_hints = extract_result["hints"]
-            mechanical_safety_tags = extract_result.get("mechanical_safety_tags", {})
-
-            if ENABLE_MECHANICAL_EXTERNAL_DETECTION and mechanical_safety_tags:
-                externals = [k for k, v in mechanical_safety_tags.items() if v == SAFETY_EXTERNAL_SITE]
-                if externals:
-                    print(f"[Safety] Mechanical detector tagged {len(externals)} off-domain elements: {externals}")
 
             current_node = compute_node_hash(current_url, available_elements)
             print(f"\n[Node: {current_node}] URL: {current_url} | Active Structural Edges: {available_elements}")
 
-            # --- Autofill forms ---
             form_inputs = await page.locator("input[type='text'], input[type='number'], textarea, input:not([type])").all()
             if form_inputs:
                 for el in form_inputs:
@@ -567,6 +530,7 @@ async def run_pathfinder_agent():
                     id_attr = (await el.get_attribute("id") or "").lower()
                     name_attr = (await el.get_attribute("name") or "").lower()
                     combined_attributes = f"{placeholder} {id_attr} {name_attr}"
+
                     for rule in autofill_rules:
                         if any(keyword.lower() in combined_attributes for keyword in rule["keywords"]):
                             current_val = await el.input_value()
@@ -574,130 +538,49 @@ async def run_pathfinder_agent():
                                 await el.fill(rule["value"])
                             break
 
-            # --- SCORING: decide if fresh AI call or use cached weights ----
-            # New STALE-SCORE logic: if (a) node was scored before, AND
-            # (b) enough workflow progress happened since (action count grew
-            # >= threshold), INVALIDATE cached weights by re-running the AI.
-            # Context is different now; old cost=1 is no longer valid.
-            need_ai_call = False
             if current_node not in state_graph:
                 state_graph[current_node] = {}
-                state_graph_metadata[current_node] = {"first_score_action_count": len(recent_actions_log)}
-                need_ai_call = True
-            else:
-                if ENABLE_STALE_SCORE_INVALIDATION:
-                    prev_count = state_graph_metadata[current_node]["first_score_action_count"]
-                    current_count = len(recent_actions_log)
-                    if current_count - prev_count >= STALE_SCORE_REASK_THRESHOLD:
-                        print(f"[StaleScore] Node {current_node} was scored at action-count={prev_count}, "
-                              f"now at action-count={current_count}. Context materially changed; re-asking AI.")
-                        state_graph_metadata[current_node]["first_score_action_count"] = current_count
-                        need_ai_call = True
 
-            if need_ai_call:
-                # Apply the IRREVERSIBLE hard block (original logic) before anything else.
-                irreversible_blocklist = [
-                    "log out", "logout", "sign out", "delete account",
-                    "cancel subscription", "deactivate account",
-                ]
                 safe_elements = [
                     e for e in available_elements
-                    if not any(k in e.lower() for k in irreversible_blocklist)
+                    if not any(k in e.lower() for k in IRREVERSIBLE_ACTION_KEYWORDS)
                 ]
                 for e in available_elements:
                     if e not in safe_elements:
                         edge_weights[(current_node, e)] = 999
 
-                # Gather FULL PAGE CONTEXT for the AI (only when enabled):
-                page_title = None
-                page_text_snippet = None
-                if ENABLE_FULL_PAGE_CONTEXT_FOR_AI:
-                    try:
-                        page_title = await page.title()
-                    except Exception:
-                        page_title = None
-                    page_text_snippet = (current_ui_text or "").strip().replace("\n", " ")[:420]
-                    if len(current_ui_text or "") > 420:
-                        page_text_snippet += "..."
+                decision = ask_ai_navigator(safe_elements, config["ai_context"], recent_actions_log)
 
-                decision = ask_ai_navigator(
-                    safe_elements,
-                    config["ai_context"],
-                    recent_actions_log,
-                    page_url=current_url,
-                    page_title=page_title,
-                    page_text_snippet=page_text_snippet,
-                    step_index=step,
-                    max_steps=max_search_depth,
-                    mechanical_safety_tags=mechanical_safety_tags,
-                )
-
-                ai_ranked = set()
                 if decision is not None:
+                    ai_ranked = set()
                     ai_ranked.add(decision["best_choice"])
                     edge_weights[(current_node, decision["best_choice"])] = 1
                     for rank, edge in enumerate(decision.get("ranked_backup", []), start=2):
                         if edge in safe_elements:
                             edge_weights[(current_node, edge)] = rank
                             ai_ranked.add(edge)
-
-                    # --- Apply SAFETY TAGS (MECHANICAL wins over AI) --------
-                    # Priority order:
-                    #   1. Mechanical tag (-1 from origin mismatch): always wins (fact, not opinion).
-                    #   2. AI's explicit #1 ranking: overrides safety cost (agent explicitly chose it).
-                    #   3. AI's own safety_tags output.
-                    #   4. Default 10.
-                    ai_safety_tags_raw = decision.get("safety_tags", {}) if ENABLE_AI_SEMANTIC_SAFETY_TAGS else {}
-
+                    # Anything NOT ranked by the AI falls through here.
+                    # Apply the generic anti-progress default if keyword matches,
+                    # else 10. AI explicit ranking ALWAYS overrides these defaults.
                     for e in safe_elements:
-                        if e in ai_ranked and e == decision["best_choice"]:
-                            pass  # AI #1 pick stays cost 1 regardless of tag (explicit choice)
+                        if e in ai_ranked:
+                            continue
+                        if any(k in e.lower() for k in ANTI_PROGRESS_KEYWORDS):
+                            edge_weights.setdefault((current_node, e), ANTI_PROGRESS_DEFAULT_WEIGHT)
                         else:
-                            mec_tag = mechanical_safety_tags.get(e, 0)
-                            ai_tag = ai_safety_tags_raw.get(e, 0) if isinstance(ai_safety_tags_raw, dict) else 0
-                            final_tag = 0
-                            if mec_tag != 0:
-                                final_tag = mec_tag
-                            elif ai_tag in (SAFETY_EXTERNAL_SITE, SAFETY_DESTRUCTIVE):
-                                final_tag = ai_tag
-                            if final_tag == SAFETY_EXTERNAL_SITE and e not in ai_ranked:
-                                edge_weights[(current_node, e)] = COST_FOR_SAFETY_EXTERNAL
-                            elif final_tag == SAFETY_DESTRUCTIVE and e not in ai_ranked:
-                                edge_weights[(current_node, e)] = COST_FOR_SAFETY_DESTRUCTIVE
-
-                    # --- Default for unranked non-tagged elements ----------
-                    for e in safe_elements:
-                        if e not in edge_weights or (current_node, e) not in edge_weights:
                             edge_weights.setdefault((current_node, e), 10)
-                        else:
-                            edge_weights.setdefault((current_node, e), edge_weights.get((current_node, e), 10))
-                    # Ensure unranked have a default fallback 10 if nothing set
-                    for e in safe_elements:
-                        if e not in ai_ranked and e not in mechanical_safety_tags:
-                            aitag = 0
-                            if ENABLE_AI_SEMANTIC_SAFETY_TAGS and isinstance(decision.get("safety_tags"), dict):
-                                aitag = decision["safety_tags"].get(e, 0)
-                            if aitag == 0:
-                                edge_weights.setdefault((current_node, e), 10)
                 else:
-                    # Fallback — AI failed twice. Use mechanical + generic progress hints.
-                    print("[Fallback] AI decision unavailable — applying mechanical tags + progress tiebreak.")
-                    progress_keywords = [
-                        "finish", "submit", "confirm", "checkout", "continue",
-                        "save", "next", "proceed", "place order",
-                    ]
+                    print("[Fallback] AI decision unavailable — using generic progress-keyword tiebreak.")
                     for e in safe_elements:
-                        mec_tag = mechanical_safety_tags.get(e, 0)
-                        if mec_tag == SAFETY_EXTERNAL_SITE:
-                            edge_weights.setdefault((current_node, e), COST_FOR_SAFETY_EXTERNAL)
-                        elif mec_tag == SAFETY_DESTRUCTIVE:
-                            edge_weights.setdefault((current_node, e), COST_FOR_SAFETY_DESTRUCTIVE)
-                        elif any(k in e.lower() for k in progress_keywords):
+                        if any(k in e.lower() for k in FALLBACK_PROGRESS_KEYWORDS):
                             edge_weights.setdefault((current_node, e), 8)
+                        elif any(k in e.lower() for k in ANTI_PROGRESS_KEYWORDS):
+                            edge_weights.setdefault((current_node, e), ANTI_PROGRESS_DEFAULT_WEIGHT)
                         else:
                             edge_weights.setdefault((current_node, e), 10)
 
             valid_edges = [edge for edge in available_elements if edge_weights.get((current_node, edge), 0) < 999]
+
             if not valid_edges:
                 print(f"[Dead End] Node {current_node} fully exhausted. Backtracking...")
                 if node_breadcrumbs:
@@ -726,9 +609,11 @@ async def run_pathfinder_agent():
             try:
                 pre_interaction_node = current_node
                 pre_interaction_edge = best_edge
+
                 locator, resolved_ok = await build_locator_for_edge(page, best_edge, element_hints)
                 if not resolved_ok:
                     print(f"[Locator] No selector matched '{best_edge}' before attempt — will try generic but expect possible failure.")
+
                 try:
                     if await locator.count() == 0 or not await locator.is_visible(timeout=700):
                         raise RuntimeError(f"Element '{best_edge}' not visible after all selector fallbacks.")
@@ -737,22 +622,27 @@ async def run_pathfinder_agent():
                     pre_interaction_node = None
                     pre_interaction_edge = None
                     raise
+
                 try:
                     await locator.scroll_into_view_if_needed(timeout=CLICK_ATTEMPT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     edge_weights[(current_node, best_edge)] = 999
                     pre_interaction_node = None
                     pre_interaction_edge = None
-                    raise RuntimeError(f"scroll_into_view timed out for '{best_edge}' — likely behind overlay or detached.")
+                    raise RuntimeError(f"scroll_into_view timed out for '{best_edge}' — likely behind an overlay or detached from DOM.")
+
                 await click_with_overlay_recovery(page, locator, best_edge)
+
                 node_breadcrumbs.append(pre_interaction_node)
                 edge_weights[(pre_interaction_node, best_edge)] += 2
+
             except Exception as edge_err:
                 print(f"[Error] Traversal Boundary Blocked: {edge_err}")
                 edge_weights[(current_node, best_edge)] = 999
 
         print("\n===== DIRECTED PATHFINDING TRANSACTION MATRIX COMPLETE =====")
         await browser.close()
+
         generate_scan_report(
             site_name=config.get("site_name", "Target Application"),
             target_goal=config["ai_context"],
