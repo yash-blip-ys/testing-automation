@@ -73,14 +73,14 @@ An AI-powered autonomous web testing and pathfinding agent that uses directed st
 
 Before starting, ensure you have the following installed on your system:
 
-| Component | Minimum Version | Required | Purpose |
-|-----------|-----------------|----------|---------|
-| Python | 3.11.x | ✅ Yes | Core runtime (tested on 3.11.9) |
-| Ollama | Latest | ✅ Yes | Local LLM inference server |
-| Llama 3.2 Model | (via Ollama) | ✅ Yes | AI heuristic decision-making |
-| Playwright Browsers | Chromium (bundled) | ✅ Yes | Browser automation engine |
-| 4GB+ RAM | — | ✅ Yes | LLM inference + browser overhead |
-| Internet Connection | — | ✅ Yes | Target web app access |
+| Component | Minimum Version |  Purpose |
+|-----------|-----------------|----------|
+| Python | 3.11.x |  Core runtime (tested on 3.11.9) |
+| Ollama | Latest |  Local LLM inference server |
+| Llama 3.2 Model | (via Ollama) |  AI heuristic decision-making |
+| Playwright Browsers | Chromium (bundled) |  Browser automation engine |
+| 4GB+ RAM | — |   LLM inference + browser overhead |
+| Internet Connection | — |Target web app access |
 
 ---
 
@@ -91,7 +91,7 @@ Before starting, ensure you have the following installed on your system:
 #### Step 1: Install Python 3.11
 1. Download Python 3.11.9 from [python.org/downloads/windows](https://www.python.org/downloads/windows/)
 2. Run the installer **as Administrator**
-3. ⚠️ **CRITICAL**: Check "**Add Python 3.11 to PATH**" before clicking Install
+3.  **CRITICAL**: Check "**Add Python 3.11 to PATH**" before clicking Install
 4. After installation, verify by opening **PowerShell** and running:
    ```powershell
    python --version
@@ -319,17 +319,17 @@ All site-specific settings are stored in **`sites_config.json`**. This file **mu
 
 ### Configuration Fields Explained
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `site_name` | string | ✅ | Human-readable name for reports |
-| `portal_url` | string | ✅ | Starting URL (entry point) |
-| `ai_context` | string | ✅ | Natural language goal description (passed to LLM heuristic) |
-| `credentials.username` | string | ✅ | Login username |
-| `credentials.password` | string | ✅ | Login password |
-| `victory_conditions.text_matches` | string[] | ✅ | Stop & report SUCCESS if any of these strings appear in page body (case-insensitive) |
-| `victory_conditions.url_substrings` | string[] | ✅ | Stop & report SUCCESS if URL contains any of these |
-| `form_autofill` | object[] | ✅ | Rules for auto-filling form fields. Each rule has `keywords` (array of matchers) and `value` (text to fill) |
-| `target_elements_query` | string | ✅ | CSS selector for clickable elements to include in state graph exploration |
+| Field | Type | Description |
+|-------|------|----------|
+| `site_name` | string |  Human-readable name for reports |
+| `portal_url` | string |  Starting URL (entry point) |
+| `ai_context` | string |  Natural language goal description (passed to LLM heuristic) |
+| `credentials.username` | string |  Login username |
+| `credentials.password` | string |  Login password |
+| `victory_conditions.text_matches` | string[] |  Stop & report SUCCESS if any of these strings appear in page body (case-insensitive) |
+| `victory_conditions.url_substrings` | string[] |  Stop & report SUCCESS if URL contains any of these |
+| `form_autofill` | object[] |  Rules for auto-filling form fields. Each rule has `keywords` (array of matchers) and `value` (text to fill) |
+| `target_elements_query` | string |  CSS selector for clickable elements to include in state graph exploration |
 
 ### Example: Adding a New Target Site
 Create a backup of your original config, then modify `sites_config.json`:
@@ -362,12 +362,12 @@ Create a backup of your original config, then modify `sites_config.json`:
 
 ### Prerun Checklist
 Before executing, ensure:
-1. ✅ Virtual environment is **activated**
-2. ✅ Ollama service is running (`ollama ps` should work)
-3. ✅ `llama3.2` model is pulled (`ollama list`)
-4. ✅ `sites_config.json` is in the **current working directory**
-5. ✅ Target application URL is reachable from your network
-6. ✅ Playwright Chromium is installed
+1.  Virtual environment is **activated**
+2.  Ollama service is running (`ollama ps` should work)
+3.  `llama3.2` model is pulled (`ollama list`)
+4.  `sites_config.json` is in the **current working directory**
+5.  Target application URL is reachable from your network
+6.  Playwright Chromium is installed
 
 ### Windows (PowerShell)
 ```powershell
@@ -407,14 +407,14 @@ python automation_engine.py
 ```
 web testing tool/
 ├── automation_engine.py       # Core agent: state graph, pathfinding, AI heuristics, reporting
-├── sites_config.json          # ⚙️ User configuration (target site, credentials, goals)
+├── sites_config.json          #  User configuration (target site, credentials, goals)
 ├── requirements.txt           # Python dependency manifest
 ├── netcheck.py                # Diagnostics: Test URL reachability
 ├── playwright_check.py        # Diagnostics: Verify Playwright install (empty placeholder)
 ├── venv311/                   # [Local] Python 3.11 virtual environment (not in Git)
 ├── __pycache__/               # [Local] Python bytecode cache
 │
-├── scan_report_*.md           # 📄 Generated execution reports (auto-created)
+├── scan_report_*.md           #  Generated execution reports (auto-created)
 ├── report_*.txt               # Sample output logs from previous runs
 └── .gitignore                 # Ignores venv, pycache, *.pyc
 ```
@@ -483,7 +483,7 @@ Each run creates a `scan_report_YYYY-MM-DD_HH-MM-SS.md` file containing:
 
 ---
 
-#### ❌ `[Error] The file 'sites_config.json' was not found`
+####  `[Error] The file 'sites_config.json' was not found`
 **Cause**: Agent is run from a different working directory.
 **Fix**:
 ```powershell
@@ -495,7 +495,7 @@ Or pass an absolute path by modifying line 87 in `automation_engine.py`.
 
 ---
 
-#### ❌ Ollama Connection Errors (timeouts, model not found)
+####  Ollama Connection Errors (timeouts, model not found)
 **Symptoms**:
 - `ollama.chat()` exceptions silently swallowed (returns `{}` — all edges default to cost 2)
 - Console shows repeated slow navigation without smart prioritization
@@ -522,7 +522,7 @@ export OLLAMA_HOST=127.0.0.1:11434
 
 ---
 
-#### ❌ Playwright Errors: "Executable doesn't exist" / Browser Launch Failures
+####  Playwright Errors: "Executable doesn't exist" / Browser Launch Failures
 **Fix**: Reinstall Playwright browsers:
 ```bash
 # Inside activated venv
@@ -543,7 +543,7 @@ playwright install chromium
 
 ---
 
-#### ❌ Authentication fails silently / "Root node authenticated" but logged out
+####  Authentication fails silently / "Root node authenticated" but logged out
 **Cause**: The CSS selector login button detection fails on your target site.
 
 **Fix**: Add the correct login button selectors to the `login_selectors` list on lines 123-124 of `automation_engine.py`. Example additions:
@@ -557,7 +557,7 @@ login_selectors = [
 
 ---
 
-#### ❌ Victory condition never triggers
+####  Victory condition never triggers
 **Problem**: Agent reaches goal page but status still shows `MAX_DEPTH_EXHAUSTED`
 
 **Check** & Fix in `sites_config.json`:
@@ -567,7 +567,7 @@ login_selectors = [
 
 ---
 
-#### ❌ Form autofill not working
+####  Form autofill not working
 **Debug**:
 1. Check that field placeholder/id/name attributes contain one of your `keywords` entries
 2. Edit `sites_config.json` → add more keyword variations to each rule
@@ -575,7 +575,7 @@ login_selectors = [
 
 ---
 
-#### ❌ Linux headless environment: "Browser closed" / Display errors
+####  Linux headless environment: "Browser closed" / Display errors
 **Option 1** (Recommended) — Run headless by editing `automation_engine.py:109`:
 ```python
 browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
@@ -623,7 +623,7 @@ which python   # (macOS/Linux)
 python -c "
 import ollama, playwright, json, asyncio, hashlib
 from playwright.async_api import async_playwright
-print('✅ All imports OK')
+print(' All imports OK')
 "
 
 # Ollama

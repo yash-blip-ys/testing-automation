@@ -1,14 +1,14 @@
-# 🤖 Autonomous Pathfinding Agent Execution Report
+# Autonomous Pathfinding Agent Execution Report
 **Timestamp:** 2026-06-05 20:08:27  
 **Target Application:** SauceLabs E-Commerce Practice Sandbox  
-**Status:** 🎉 SUCCESS (SUCCESS_TARGET_REACHED)  
+**Status:**  SUCCESS (SUCCESS_TARGET_REACHED)  
 
 ---
 
-## 🎯 Objective
+##  Objective
 > Select a product, add it to the shopping cart, navigate to the checkout page, fill out the required shipping details, and successfully complete the order confirmation.
 
-## 📊 Summary Metrics
+## Summary Metrics
 | Metric | Value |
 | :--- | :--- |
 | **Total Transitions Executed** | 9 |
@@ -16,7 +16,7 @@
 
 ---
 
-## 🗺️ Execution Trajectory (Path Log)
+##  Execution Trajectory (Path Log)
 Below is the exact step-by-step route your agent took through the application's directed state graph:
 
 | Step | Source Node | Current URL | Action Taken (Edge) | Assigned Cost |
