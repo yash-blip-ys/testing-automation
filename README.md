@@ -12,60 +12,100 @@ An AI-powered autonomous web testing and pathfinding agent that uses directed st
   - [Linux Setup (Ubuntu/Debian)](#linux-setup-ubuntudebian)
 - [Configuration](#configuration)
 - [Running the Agent](#running-the-agent)
+- [Agent Behavior Tuning (Kill Switches)](#agent-behavior-tuning-kill-switches)
+- [Safety Tag System](#safety-tag-system)
+- [Stale Score Invalidation](#stale-score-invalidation)
 - [Project Structure](#project-structure)
 - [Understanding the Output](#understanding-the-output)
 - [Troubleshooting](#troubleshooting)
 - [Network Diagnostics](#network-diagnostics)
+- [Reverting Changes (Backup Files)](#reverting-changes-backup-files)
 
 ---
 
 ## Features
 
-- **Directed State-Graph Exploration**: Maps web application states as nodes and clickable actions as edges
-- **LLM-Assisted Heuristic Pathfinding**: Uses local LLM (Ollama + Llama 3.2) to prioritize navigation paths
-- **A*-like Search Algorithm**: Combines AI-weighted edge costs with graph traversal for efficient navigation
-- **Auto-Form Filling**: Automatically populates form fields based on keyword rules
-- **Automatic Authentication**: Detects and fills login forms with provided credentials
-- **Structured Markdown Reports**: Generates detailed execution reports with trajectory logs and metrics
-- **Configurable Target Sites**: JSON-based configuration for testing different applications
-- **Head/Headless Modes**: Visual browser interaction via Playwright (non-headless by default for debugging)
+- **Directed State-Graph Exploration**: Maps web application states as nodes (URL + visible element list, MD5-hashed) and clickable actions as weighted edges
+- **Full-Page-Context LLM Navigator**: Passes current URL, page title, body text preview, and run depth to Ollama/Llama 3.2 so the AI knows exactly what page it is on before ranking buttons
+- **A*-like Cost-Based Pathfinding**: Combines AI-assigned priority (1 = best) with mechanical safety penalties and same-node loop guard
+- **Mechanical External-Link Detector**: 100% accurate, zero-LLM-cost detection of off-domain `<a>` tags via `window.location.origin` comparison (no keyword lists)
+- **LLM-Originated Semantic Safety Tags**: AI must classify every available element as `0` (safe), `-1` (external site), or `-2` (destructive / undo-progress)
+- **Stale Score Invalidation**: When returning to a previously visited page after ≥4 new workflow actions, cached AI scoring is discarded and the AI is re-prompted with the updated context
+- **Environment Preflight Check**: Emits a loud banner warning if executed outside the `venv311` virtual environment or with a Python version other than 3.11.x (never blocks execution)
+- **Overlay-Aware Click Recovery**: Before failing a blocked click, auto-closes open slide-out menus, role=dialog modals, or presses Escape to dismiss overlays
+- **Locator Fallback Chain with Source Hints**: Each element's label is tagged at extraction time with its source (text / value / placeholder / id / special) so the correct CSS selector family is tried first (fixes id-labeled elements like `item_4_img_link`)
+- **Futile-Action Penalty**: Any click that results in the same node hash (no page change, no DOM structure change) costs +50 on the next try instead of the slow +2
+- **Auto-Form Filling**: Automatically populates form fields via placeholder/id/name keyword matching rules
+- **Automatic Authentication**: Auto-detects username/password fields and cycles through common login button selectors
+- **Structured Markdown Reports**: Timestamped execution reports with trajectory log, metrics tables, and SUCCESS/FAILED status
+- **Configurable Target Sites**: JSON-based `sites_config.json` for swapping between applications
+- **Non-Headless Default**: Visual browser interaction via Playwright Chromium (for debugging / observability)
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────┐
-│            Autonomous Pathfinding Agent             │
-├─────────────────────────────────────────────────────┤
-│                                                     │
-│  User Config (sites_config.json)                    │
-│         │                                           │
-│         ▼                                           │
-│  [Playwright Browser]  <─── Web Interaction         │
-│         │                                           │
-│         ▼                                           │
-│  State Graph Builder (Node Hashing)                 │
-│         │                                           │
-│         ▼                                           │
-│  AI Edge Weighing (Ollama Llama 3.2)                │
-│         │                                           │
-│         ▼                                           │
-│  Pathfinding Engine (Cost-Based Selection)          │
-│         │                                           │
-│         ▼                                           │
-│  Report Generator (Markdown Output)                 │
-│                                                     │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│            Autonomous Pathfinding Agent                               │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  User Config (sites_config.json)                                      │
+│    │    site_name, portal_url, credentials, victory, autofill,        │
+│    │    ai_context (goal), target_elements_query                      │
+│    ▼                                                                  │
+│  Environment Preflight ─────► banner if Python != 3.11 or !venv311    │
+│    │                                                                  │
+│    ▼                                                                  │
+│  [Playwright Chromium Browser]                                        │
+│    │   1280×720 viewport, anti-detection args, dialog auto-accept     │
+│    ▼                                                                  │
+│  Authentication Flow ───► fills user/pass, clicks login submitters    │
+│    │                                                                  │
+│    ▼                                                                  │
+│  Main Loop (up to 25 steps):                                          │
+│    │                                                                  │
+│    ├─ safe_wait_for_load()  networkidle w/ domcontentloaded fallback  │
+│    ├─ Victory Check (URL substrings + body text matches)              │
+│    ├─ Futile-action penalty (if previous click caused 0 state change) │
+│    ├─ Extract Elements + Mechanical Safety Tags (origin mismatch -1)  │
+│    ├─ Hash Node (URL + sorted elements → MD5 10-char signature)       │
+│    ├─ Autofill Forms (placeholder/id/name keyword rules)              │
+│    ├─ Stale-Score Check: re-ask AI if workflow progressed ≥4 actions  │
+│    ├─ ask_ai_navigator() → {best_choice, ranked_backup, safety_tags,  │
+│    │                         reasoning} + optional FULL PAGE CONTEXT   │
+│    ├─ Apply Costs: AI ranking → mechanical → AI safety → default=10   │
+│    ├─ build_locator_for_edge() (hints first, 4-strategy fallback)     │
+│    ├─ click_with_overlay_recovery() (auto-close bm-menu/dialog/Esc)   │
+│    ├─ On error: edge weight = 999 (never retried)                     │
+│    └─ On success: append trajectory, +2 base cost for future retries  │
+│                                                                       │
+│    ▼                                                                  │
+│  Final Status → generate_scan_report()                                │
+│    │   Markdown report: metadata, objective, metrics, trajectory tbl  │
+│    ▼                                                                  │
+│  scan_report_YYYY-MM-DD_HH-MM-SS.md saved in cwd                      │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
-### Core Components:
+### Core Components & Entry Points:
 
-1. **State Node Hashing** (`automation_engine.py:10-16`) - Generates unique MD5-based signatures for each UI state using URL + clickable elements
-2. **AI Heuristic Function** (`automation_engine.py:18-40`) - Queries local LLM to assign priority weights (1-5) to each available action
-3. **Graph Traversal** (`automation_engine.py:145-265`) - Explores the state graph up to max depth (25 steps), backtracking on dead ends
-4. **Victory Detection** (`automation_engine.py:159-165`) - Detects goal completion via text matches or URL substrings
-5. **Report Engine** (`automation_engine.py:42-82`) - Compiles Markdown audit reports with trajectory tables and metrics
+| Logic Area | File:Line | Function / Constant |
+|---|---|---|
+| Entry point | `automation_engine.py:765` | `asyncio.run(run_pathfinder_agent())` |
+| All kill-switches / tuning constants | `automation_engine.py:12-74` | Top of file, one section |
+| Environment preflight warning | `automation_engine.py:78-91` | `check_environment()` |
+| Node hashing | `automation_engine.py:94-96` | `compute_node_hash(url, elements)` |
+| Safe load-state (anti-30s-freeze) | `automation_engine.py:99-107` | `safe_wait_for_load(page, timeout_ms=8000)` |
+| Navigator response validation | `automation_engine.py:109-130` | `_validate_navigator_response()` |
+| **AI Navigator** (full-page-context + safety tags) | `automation_engine.py:132-253` | `ask_ai_navigator()` |
+| Markdown report writer | `automation_engine.py:255-288` | `generate_scan_report()` |
+| Auto-close open menus / modals | `automation_engine.py:290-316` | `close_blocking_overlays()` |
+| Click retried once with overlay recovery | `automation_engine.py:318-326` | `click_with_overlay_recovery()` |
+| Hint-aware locator + fallback chain | `automation_engine.py:328-372` | `build_locator_for_edge()` |
+| Main loop orchestration | `automation_engine.py:374-764` | `run_pathfinder_agent()` |
+| Max search depth limit | `automation_engine.py:454` (`for step in range(max_search_depth)`) | default = `25` |
 
 ---
 
@@ -73,14 +113,14 @@ An AI-powered autonomous web testing and pathfinding agent that uses directed st
 
 Before starting, ensure you have the following installed on your system:
 
-| Component | Minimum Version |  Purpose |
-|-----------|-----------------|----------|
-| Python | 3.11.x |  Core runtime (tested on 3.11.9) |
-| Ollama | Latest |  Local LLM inference server |
-| Llama 3.2 Model | (via Ollama) |  AI heuristic decision-making |
-| Playwright Browsers | Chromium (bundled) |  Browser automation engine |
-| 4GB+ RAM | — |   LLM inference + browser overhead |
-| Internet Connection | — |Target web app access |
+| Component | Exact Version | Purpose |
+|---|---|---|
+| Python | 3.11.x (tested: 3.11.9) | Core runtime; the agent emits a WARNING banner if any other version is used |
+| Ollama | Latest | Local LLM inference server (Windows service / macOS app / Linux systemd unit) |
+| Llama 3.2 model | pulled via Ollama | AI heuristic decision-making (default model name used in code: `llama3.2` on line 167) |
+| Playwright Chromium | Bundled with `playwright==1.60.0` | Browser automation engine — required even if Chrome is already installed |
+| 4 GB+ RAM | — | LLM inference + browser + OS overhead |
+| Internet connection | — | Target web app access + Ollama model download |
 
 ---
 
@@ -91,27 +131,27 @@ Before starting, ensure you have the following installed on your system:
 #### Step 1: Install Python 3.11
 1. Download Python 3.11.9 from [python.org/downloads/windows](https://www.python.org/downloads/windows/)
 2. Run the installer **as Administrator**
-3.  **CRITICAL**: Check "**Add Python 3.11 to PATH**" before clicking Install
-4. After installation, verify by opening **PowerShell** and running:
+3. **CRITICAL**: Check "**Add Python 3.11 to PATH**" before clicking Install
+4. After installation, verify by opening **PowerShell**:
    ```powershell
    python --version
    # Expected output: Python 3.11.9
    ```
-5. If `python` doesn't work, try `py -3.11 --version` (Python Launcher for Windows)
+5. If `python` doesn't resolve, try `py -3.11 --version` (Python Launcher for Windows).
 
 #### Step 2: Install Ollama
 1. Download Ollama for Windows from [ollama.com/download/windows](https://ollama.com/download/windows)
-2. Run the installer (`OllamaSetup.exe`) and follow the setup wizard
-3. Once installed, Ollama will start automatically as a background service
+2. Run the installer (`OllamaSetup.exe`) and follow the wizard
+3. Once installed, Ollama runs automatically as a background service
 4. Pull the Llama 3.2 model (open a **new** PowerShell window):
    ```powershell
    ollama pull llama3.2
    ```
-   Wait for the download to complete (~2GB for the 3B model variant)
+   Download size: ~2 GB for the default 3B variant.
 5. Verify the model is available:
    ```powershell
    ollama list
-   # You should see "llama3.2" in the list
+   # You should see "llama3.2" in the output list
    ```
 
 #### Step 3: Clone / Copy the Project
@@ -120,7 +160,7 @@ cd "C:\Users\YourUser\Projects"
 git clone <your-repo-url> web-testing-tool
 cd web-testing-tool
 ```
-*Or simply copy the project folder to your desired location.*
+*Or just copy the project folder to your desired location.*
 
 #### Step 4: Create Virtual Environment & Install Dependencies
 ```powershell
@@ -132,26 +172,26 @@ python -m venv venv311
 # Activate the virtual environment
 .\venv311\Scripts\Activate.ps1
 
-# If you get execution policy error, run this first (one-time only):
+# If you get an "execution policy" error, run this ONCE (per-user):
 # Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-# Install Python dependencies
+# Install pinned dependency manifest
 pip install -r requirements.txt
 ```
 
 #### Step 5: Install Playwright Browser Binaries
 ```powershell
-# Inside the activated virtual environment
+# Inside the activated venv only
 playwright install chromium
 ```
-This downloads ~300MB of Chromium browser binaries. This is **required** even if Chrome is already installed on your system.
+Downloads ~300 MB of Chromium binaries specific to the pinned Playwright version 1.60.0. Required even if Chrome is already installed on the system.
 
 #### Step 6: Verify Installation
 ```powershell
-# Verify Python packages
-python -c "import ollama; import playwright; print('Core dependencies OK')"
+# Core imports
+python -c "import ollama, playwright, asyncio, json, hashlib, re; print('Core dependencies OK')"
 
-# Quick connectivity test to Ollama
+# Ollama service connectivity
 ollama ps
 ```
 
@@ -160,16 +200,16 @@ ollama ps
 ### macOS Setup
 
 #### Step 1: Install Python 3.11
-**Option A: Official Installer**
+**Option A — Official Installer (simplest):**
 1. Download from [python.org/downloads/macos](https://www.python.org/downloads/macos/)
-2. Install the `.pkg` file (macOS 64-bit universal2 installer)
+2. Run the universal2 `.pkg` installer
 
-**Option B: Homebrew (Recommended)**
+**Option B — Homebrew:**
 ```bash
 brew install python@3.11
 ```
 
-Verify installation:
+Verify:
 ```bash
 python3.11 --version
 # Expected: Python 3.11.9
@@ -177,20 +217,19 @@ python3.11 --version
 
 #### Step 2: Install Ollama
 ```bash
-# Download and install via Homebrew Cask
+# Homebrew Cask (recommended):
 brew install --cask ollama
 
-# OR download from: https://ollama.com/download/mac
-# and drag Ollama.app to your Applications folder
+# OR download the dmg from: https://ollama.com/download/mac
+#    then drag Ollama.app to /Applications
 ```
 
-Start Ollama service and pull the model:
+Start the app and pull the model:
 ```bash
-# Start Ollama app (or it runs automatically after install)
 ollama pull llama3.2
 ```
 
-#### Step 3: Clone / Copy Project
+#### Step 3: Clone / Copy the Project
 ```bash
 cd ~/Projects
 git clone <your-repo-url> web-testing-tool
@@ -201,23 +240,18 @@ cd web-testing-tool
 ```bash
 cd /path/to/web-testing-tool
 
-# Create venv
 python3.11 -m venv venv311
-
-# Activate venv
 source venv311/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 #### Step 5: Install Playwright Browsers
 ```bash
-# With venv activated
+# Still inside activated venv
 playwright install chromium
 
-# Optional: Install system dependencies for Playwright
-# (may require sudo on first run)
+# Optional but recommended: install system libs Playwright needs
 playwright install-deps chromium
 ```
 
@@ -227,10 +261,7 @@ playwright install-deps chromium
 
 #### Step 1: Install Python 3.11
 ```bash
-# Update packages
 sudo apt update && sudo apt upgrade -y
-
-# Install Python 3.11 and dev tools
 sudo apt install -y software-properties-common
 sudo add-apt-repository ppa:deadsnakes/ppa -y
 sudo apt update
@@ -242,13 +273,12 @@ Verify:
 python3.11 --version
 ```
 
-#### Step 2: Install Ollama on Linux
+#### Step 2: Install Ollama
 ```bash
-# Install via official script (recommended)
+# Official install script (creates a systemd service):
 curl -fsSL https://ollama.com/install.sh | sh
 
-# The service should start automatically via systemd
-# Verify service status
+# Verify service started:
 sudo systemctl status ollama
 ```
 
@@ -257,7 +287,7 @@ Pull the Llama model:
 ollama pull llama3.2
 ```
 
-**Note**: If running on a headless server without GPU, the 3B parameter Llama 3.2 variant works best.
+Headless / no-GPU servers work best with the 1B or 3B Llama 3.2 variant.
 
 #### Step 3: Project & Dependencies
 ```bash
@@ -266,35 +296,31 @@ sudo git clone <your-repo-url> web-testing-tool
 sudo chown -R $USER:$USER web-testing-tool
 cd web-testing-tool
 
-# Create and activate venv
 python3.11 -m venv venv311
 source venv311/bin/activate
 
-# Install Python packages
 pip install -r requirements.txt
 ```
 
-#### Step 4: Install Playwright + System Dependencies
+#### Step 4: Install Playwright + Required System Libraries
 ```bash
-# Install Chromium browser
 playwright install chromium
 
-# Install system-level dependencies (required for Linux)
-# This installs libnss3, libatk, libgbm, fonts, etc.
+# Installs libnss3, libatk, libgbm, fontconfig, etc. REQUIRED on Linux.
 sudo playwright install-deps chromium
 ```
 
-**Headless Server Note**: The agent currently runs in **non-headless** mode by default (`automation_engine.py:109`). If running on a server without a display, you need to either:
-- Install a virtual display: `sudo apt install xvfb` and prefix runs with `xvfb-run`
-- Or modify the code: change `headless=False` to `headless=True` on line 109
+**Headless Server Display Workaround**: The agent runs with `headless=False` (line 410 of `run_pathfinder_agent()`) so a browser window is visible during runs. For servers without a physical display either:
+1. Edit `automation_engine.py` line 410 → `headless=True`, or
+2. Install a virtual framebuffer: `sudo apt install -y xvfb` and prefix runs with `xvfb-run -a python automation_engine.py`
 
 ---
 
 ## Configuration
 
-All site-specific settings are stored in **`sites_config.json`**. This file **must** be present in the project's working directory when running the agent.
+All site-specific settings live in **`sites_config.json`**, which **must** be present in the working directory at script launch.
 
-### Default Configuration Structure
+### Default Configuration (current working file)
 ```json
 {
   "site_name": "SauceLabs E-Commerce Practice Sandbox",
@@ -317,22 +343,22 @@ All site-specific settings are stored in **`sites_config.json`**. This file **mu
 }
 ```
 
-### Configuration Fields Explained
+### Configuration Field Reference
 
 | Field | Type | Description |
-|-------|------|----------|
-| `site_name` | string |  Human-readable name for reports |
-| `portal_url` | string |  Starting URL (entry point) |
-| `ai_context` | string |  Natural language goal description (passed to LLM heuristic) |
-| `credentials.username` | string |  Login username |
-| `credentials.password` | string |  Login password |
-| `victory_conditions.text_matches` | string[] |  Stop & report SUCCESS if any of these strings appear in page body (case-insensitive) |
-| `victory_conditions.url_substrings` | string[] |  Stop & report SUCCESS if URL contains any of these |
-| `form_autofill` | object[] |  Rules for auto-filling form fields. Each rule has `keywords` (array of matchers) and `value` (text to fill) |
-| `target_elements_query` | string |  CSS selector for clickable elements to include in state graph exploration |
+|---|---|---|
+| `site_name` | string | Human-readable label used in the generated report header |
+| `portal_url` | string | Starting URL the browser navigates to (login page / portal entry) |
+| `ai_context` | string | Full natural-language goal passed to the LLM navigator at every decision step |
+| `credentials.username` | string | Used to fill the first matched username/login email field |
+| `credentials.password` | string | Used to fill the first matched password field |
+| `victory_conditions.text_matches` | string[] | Agent halts with status `SUCCESS_TARGET_REACHED` if any string appears (case-insensitive) in `document.body.innerText` |
+| `victory_conditions.url_substrings` | string[] | Agent halts with SUCCESS if `current_url.lower()` contains any substring |
+| `form_autofill[].keywords` | string[] | Each input is tested by combining `placeholder + id + name` (lowercase); if ANY keyword substring matches, the field is filled |
+| `form_autofill[].value` | string | Text inserted into matched fields |
+| `target_elements_query` | string | CSS selector passed to `document.querySelectorAll()` to enumerate clickable candidate elements |
 
-### Example: Adding a New Target Site
-Create a backup of your original config, then modify `sites_config.json`:
+### Adding a New Target Site (Example)
 ```json
 {
   "site_name": "Your Internal Admin Portal",
@@ -361,24 +387,22 @@ Create a backup of your original config, then modify `sites_config.json`:
 ## Running the Agent
 
 ### Prerun Checklist
-Before executing, ensure:
-1.  Virtual environment is **activated**
-2.  Ollama service is running (`ollama ps` should work)
-3.  `llama3.2` model is pulled (`ollama list`)
-4.  `sites_config.json` is in the **current working directory**
-5.  Target application URL is reachable from your network
-6.  Playwright Chromium is installed
+1. Virtual environment is **activated**
+2. Ollama service running (`ollama ps` returns OK)
+3. `llama3.2` model downloaded (`ollama list`)
+4. `sites_config.json` exists in the **current working directory**
+5. Target application URL is reachable
+6. Playwright Chromium installed inside the venv
 
 ### Windows (PowerShell)
 ```powershell
 cd "C:\path\to\web testing tool"
 .\venv311\Scripts\Activate.ps1
 
-# Run the main automation engine
 python automation_engine.py
 ```
 
-### macOS / Linux (Bash/Zsh)
+### macOS / Linux (Bash / Zsh)
 ```bash
 cd /path/to/web-testing-tool
 source venv311/bin/activate
@@ -386,19 +410,113 @@ source venv311/bin/activate
 python automation_engine.py
 ```
 
-### What Happens During Execution:
-1. **Initialization** — Loads `sites_config.json`, starts Chromium browser window
-2. **Authentication** — Auto-detects username/password fields, fills credentials, clicks login button
-3. **Graph Exploration Phase** (up to 25 steps):
-   - Hashes current page state (URL + visible buttons/links)
-   - Queries Ollama/Llama 3.2 for AI priority weights on clickable elements
-   - Applies hardcoded funnel heuristics (checkout/finish = cost 1; logout/cancel = cost 5)
-   - Selects lowest-cost edge, clicks it, records trajectory
-   - Checks victory conditions on every page load
-   - Backtracks via browser history if dead-end node reached
-4. **Report Generation** — Saves a timestamped Markdown report to the project directory
+### What Happens During Execution
+1. **Preflight banner** — If Python ≠ 3.11.x or `sys.executable` not inside `venv311`, a 70-column warning banner prints immediately (execution still proceeds)
+2. **Initialization** — `sites_config.json` loaded, Chromium browser launched at 1280×720 with anti-automation args
+3. **Navigation & Authentication** — Goes to `portal_url`, fills user/pass fields, cycles through 5 common login button selectors, falls back to pressing Enter if none match
+4. **Graph Exploration Phase** (up to 25 steps, `max_search_depth = 25`):
+   - `safe_wait_for_load()` — waits up to 8 s for `networkidle`, then falls back gracefully to `domcontentloaded` (never 30 s freeze)
+   - Victory condition check on page text + URL
+   - Futile-action penalty: if previous click produced identical node hash, +50 applied
+   - Element extraction: visible elements matching `target_elements_query`, labels produced by `innerText → value → placeholder → id` fallback chain, each labeled with its source hint
+   - Mechanical external-link detection: any absolute-href `<a>` whose URL origin differs from `window.location.origin` gets `safety_tag = -1`
+   - Node hashing: URL + sorted visible element list → 10-char MD5 signature
+   - Autofill pass over `input[type=text/number], textarea, input:not([type])` using `form_autofill` rules
+   - Stale-score decision: re-ask AI if ≥ `STALE_SCORE_REASK_THRESHOLD` new actions since node was first scored
+   - Navigator call: passes goal, recent actions, optional FULL PAGE CONTEXT (URL + title + preview + step depth), mechanically proven tags; expects `{best_choice, ranked_backup, reasoning, safety_tags}`
+   - Edge costs: AI ranking 1..N → mechanical override (-1→50, -2→998) → AI safety tag default → fallback 10 (progress keywords bias to 8 when AI fully fails)
+   - `build_locator_for_edge()` tries source-hint first, then 4 strategies (text / input[value] / [id] / a[id])
+   - Fail-fast visibility check before scroll; 4-second cap on `scroll_into_view_if_needed`
+   - `click_with_overlay_recovery()` — on timeout, auto-closes bm-menu / role=dialog / presses Esc then retries once
+   - Dead-end (all edges = 999) → `page.go_back()` or `GRAPH_COMPLETELY_EXHAUSTED`
+5. **Report Generation** — Timestamped Markdown file written to cwd; stdout prints full absolute path
 
-**Typical runtime**: 30 seconds to 3 minutes depending on site complexity and LLM response speed.
+Typical runtime: 30 s – 3 min depending on site complexity and Llama response speed.
+
+---
+
+## Agent Behavior Tuning (Kill Switches)
+
+Every non-trivial behavior is controlled by a module-level constant at the **top of `automation_engine.py` (lines 19–74)**. No need to restore a backup file just to disable one feature — flip the constant.
+
+| Constant | Default | Meaning / Effect |
+|---|---|---|
+| `ENABLE_FULL_PAGE_CONTEXT_FOR_AI` | `True` | When `False`, AI navigator receives only the original blind inputs: goal + recent actions + button list. No URL/title/page-preview/step-depth context. Use to reproduce the old class of hallucinations ("Continue" button on checkout-step-2) for comparison. |
+| `ENABLE_STALE_SCORE_INVALIDATION` | `True` | When `False`, AI scores are **permanently cached** on the first visit to a node, exactly like the original code path (regressive "cost=1 at step 1 still costs 1 at step 14" bug). |
+| `STALE_SCORE_REASK_THRESHOLD` | `4` | How many new workflow actions must occur between visits for a node's cached score to be invalidated and the AI re-queried with fresh context. Lower = more re-asks / less cache reuse. |
+| `ENABLE_MECHANICAL_EXTERNAL_DETECTION` | `True` | When `False`, skips origin-based off-domain detection entirely; no automatic `-1` tag for links to Twitter/Facebook/marketing sites. |
+| `ENABLE_AI_SEMANTIC_SAFETY_TAGS` | `True` | When `False`, AI navigator prompt does NOT ask for per-element safety classification; `safety_tags` are ignored in validation and only mechanical tags apply. |
+| `SAFETY_EXTERNAL_SITE` | `-1` | Tag numeric constant for "leaves current website". Matches the specification. |
+| `SAFETY_DESTRUCTIVE` | `-2` | Tag numeric constant for "destructive / undo-progress". Matches the specification. |
+| `COST_FOR_SAFETY_EXTERNAL` | `50` | Edge weight applied when element has `-1` safety tag and AI did NOT rank it #1 explicitly. Kept < 999 so an explicit AI choice can still override. |
+| `COST_FOR_SAFETY_DESTRUCTIVE` | `998` | Edge weight applied when element has `-2` safety tag and AI did NOT rank it #1 explicitly. Near-blocked (only AI's #1 choice overrides). |
+| `FUTILE_ACTION_PENALTY` | `50` | Cost bump applied to edges where a click produced the **identical node hash** on the next iteration. Replaces the original slow `+2` bump for same-noop retries. |
+| `CLICK_ATTEMPT_TIMEOUT_MS` | `4000` | Millisecond cap for a single `scroll_into_view_if_needed` or `click` attempt. The original Playwright default was 30000 (30 s freezes). |
+| `RECENT_ACTIONS_MEMORY` | `5` | How many of the agent's last actions are fed back into the navigator prompt as context. |
+| `EXPECTED_PYTHON_VERSION` | `(3, 11)` | Tuple compared to `sys.version_info[:2]` for the preflight banner warning only. Never blocks execution. |
+| `EXPECTED_VENV_MARKER` | `"venv311"` | Substring searched in `sys.prefix` and `sys.executable` for the preflight banner warning only. |
+
+---
+
+## Safety Tag System
+
+Every clickable element can receive a numeric safety classification that drives edge-cost penalties. Two independent layers produce these tags:
+
+### Layer 1 — Mechanical Detector (`ENABLE_MECHANICAL_EXTERNAL_DETECTION = True`)
+100% accurate, site-agnostic, zero LLM cost. Runs inside the element extraction `evaluate()` call before any AI invocation:
+- For each labeled element that is or wraps an `<a>` tag with an absolute `href`:
+  - `new URL(href, location).origin !== location.origin` ⇒ `safety_tag = -1`
+- Applies to all off-domain navigation: social networks, marketing/about pages, documentation, partner sites.
+
+When the detector fires you see this in stdout:
+```
+[Safety] Mechanical detector tagged 4 off-domain elements: ['Twitter', 'Facebook', 'LinkedIn', 'About']
+```
+
+Provenance is explicitly passed **back to the LLM in its prompt** as the `MECHANICALLY PROVEN SAFETY TAGS` block, and the validator instructions forbid the AI from downgrading a mechanically proven tag to `0`. During edge-cost application, mechanical tags **always take precedence over AI-suggested tags**.
+
+### Layer 2 — LLM Semantic Classification (`ENABLE_AI_SEMANTIC_SAFETY_TAGS = True`)
+The navigator prompt explicitly requires every element to receive a tag:
+- `0` = safe in-app navigation
+- `-1` = leads off-domain (AI still marks these independently as a cross-check)
+- `-2` = destructive / undo-progress action (Remove item, Cancel form/order, Reset app state, Delete account, Sign out, Cancel subscription, Close without saving)
+
+The JSON schema is validated by `_validate_navigator_response()` (`automation_engine.py:109-130`) which:
+- Ensures `safety_tags` is a JSON object with string keys and integer values only
+- Ensures every value is in `{0, -1, -2}` (no other integers allowed)
+
+### Priority Order When Applying Costs
+1. AI's explicit `best_choice` (#1 pick) always stays at its AI-assigned rank cost (1). No tag can demote the AI's explicit #1 pick — it chose deliberately.
+2. Mechanical proven tags override everything else (Layer 1):
+   - `-1` → `COST_FOR_SAFETY_EXTERNAL` = 50
+   - `-2` → `COST_FOR_SAFETY_DESTRUCTIVE` = 998
+3. AI-assigned tags for items not ranked in top-N:
+   - `-1` → 50, `-2` → 998
+4. Untagged, AI-unranked elements → fallback 10 (or 8 when AI fully failed and element matches generic progress-keyword list like finish/submit/checkout)
+
+The intent: safety penalties never block an intentional choice, but they do strongly deprioritize unconsidered side-actions.
+
+---
+
+## Stale Score Invalidation
+
+### Why It Exists
+The original code path cached AI decisions permanently on first visit to a node: if Inventory page was scored at step 1, returning to that same Inventory page at step 14 after starting and abandoning checkout would still use the step-1 priorities — even though "Shopping Cart" now makes more sense than "Add to cart" and the AI would say so if asked with the updated trajectory context.
+
+### How It Works Now (Enabled)
+- A companion dict `state_graph_metadata` stores, per node hash:
+  ```python
+  {"first_score_action_count": len(recent_actions_log)}
+  ```
+- On every visit to an already-seen node, the length of `recent_actions_log` is compared to the stored snapshot.
+- If `current_count - previous_count >= STALE_SCORE_REASK_THRESHOLD` (default ≥ 4 new actions), cached scores are intentionally skipped: the AI is re-asked with all new recent-actions context and updated page context.
+- `state_graph_metadata` is updated to the new `action_count` on re-ask so a further progress measurement is possible.
+
+Stdout shows this log line when a re-ask fires:
+```
+[StaleScore] Node cab39423af was scored at action-count=2,
+now at action-count=10. Context materially changed; re-asking AI.
+```
 
 ---
 
@@ -406,259 +524,244 @@ python automation_engine.py
 
 ```
 web testing tool/
-├── automation_engine.py       # Core agent: state graph, pathfinding, AI heuristics, reporting
-├── sites_config.json          #  User configuration (target site, credentials, goals)
-├── requirements.txt           # Python dependency manifest
-├── netcheck.py                # Diagnostics: Test URL reachability
-├── playwright_check.py        # Diagnostics: Verify Playwright install (empty placeholder)
-├── venv311/                   # [Local] Python 3.11 virtual environment (not in Git)
-├── __pycache__/               # [Local] Python bytecode cache
-│
-├── scan_report_*.md           #  Generated execution reports (auto-created)
-├── report_*.txt               # Sample output logs from previous runs
-└── .gitignore                 # Ignores venv, pycache, *.pyc
+├── automation_engine.py                    # Core agent (state graph, full-context AI navigator, safety tags, overlay recovery, stale invalidation, reporting)
+├── sites_config.json                       # User configuration (target site, credentials, goal, victory, autofill)
+├── requirements.txt                        # Pinned Python 3.11 dependency manifest (84 packages, playwright==1.60.0, ollama==0.6.2, etc.)
+├── netcheck.py                             # Diagnostics: HTTP GET to target URL, report reachability
+├── playwright_check.py                     # Diagnostics: placeholder Playwright smoke check
+├── agent_knowledge.json                    # (if ever created) reserved for persistent memories across runs
+├── venv311/                                # [Local] Python 3.11 virtual environment — NEVER copy between devices/OS
+├── __pycache__/                            # [Local] Python bytecode cache
+├── automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py   # Snapshot before navigator context + stale-score + safety-tag refactor
+├── automation_engine_BACKUP_BEFORE_FIXES_20260910.py                # Snapshot before the first bug-fix round (original baseline)
+├── scan_report_*.md                        # Generated execution reports (timestamped, auto-created, gitignored)
+├── report_*.txt                            # Sample stdout capture logs from previous runs
+├── .gitignore                              # Ignores venv311/, __pycache__/, scan_report_*.md, *.pyc
+└── README.md                               # This document
 ```
-
-### Key Code Locations:
-
-| Logic Area | File:Line |
-|------------|-----------|
-| Entry point / main async function | `automation_engine.py:85` |
-| State node hashing algorithm | `automation_engine.py:10-16` |
-| Ollama LLM call (edge weighting) | `automation_engine.py:18-40` |
-| Browser launch & viewport setup | `automation_engine.py:108-111` |
-| Authentication flow | `automation_engine.py:119-143` |
-| Victory / success detection | `automation_engine.py:159-165` |
-| Extraction of clickable elements | `automation_engine.py:167-179` |
-| Form auto-fill engine | `automation_engine.py:184-197` |
-| Core edge cost / heuristic logic | `automation_engine.py:199-220` |
-| Action execution (clicking elements) | `automation_engine.py:246-264` |
-| Max search depth limit | `automation_engine.py:148` (default: 25) |
 
 ---
 
 ## Understanding the Output
 
-### Console Output Example
+### Console Output
 ```
+======================================================================
+[WARNING] Environment mismatch detected.
+  Running interpreter : C:\Python313\python.exe
+  Running version     : 3.13.0
+  Expected            : Python 3.11 inside a 'venv311' virtual environment
+  Activate the venv before running this script.
+======================================================================
+
 [Initialization] Initializing Directed State-Graph Pathfinder Agent for: SauceLabs E-Commerce Practice Sandbox
 [*] Navigating to initial root node: https://www.saucedemo.com/
 [+] Root node authenticated. Entering graph exploration phase.
 
-[Node: cab39423af] URL: https://www.saucedemo.com/inventory.html | Active Structural Edges: ['Sauce Labs Backpack', 'Add to cart', ...]
--> Traversing Edge: 'Sauce Labs Backpack' (Path Cost: 1)
+[Node: cab39423af] URL: https://www.saucedemo.com/inventory.html | Active Structural Edges: ['Open Menu', 'Shopping Cart', ...]
+[Safety] Mechanical detector tagged 4 off-domain elements: ['Twitter', 'Facebook', 'LinkedIn', 'About']
+-> Traversing Edge: 'Add to cart' (Path Cost: 1)
 
-[SUCCESS] Targeted Destination Node Reached in 7 structural transitions!
+[Node: b8b4d85ab4] URL: https://www.saucedemo.com/inventory.html | ...
+-> Traversing Edge: 'Shopping Cart' (Path Cost: 1)
+
+[SUCCESS] Targeted Destination Node Reached in 6 structural transitions!
 
 ===== DIRECTED PATHFINDING TRANSACTION MATRIX COMPLETE =====
-[REPORT GENERATED] File saved successfully: C:\path\to\scan_report_2026-09-07_16-07-28.md
+[REPORT GENERATED] File saved successfully: C:\path\to\scan_report_2026-09-10_20-19-25.md
 ```
 
-### Generated Markdown Report
-Each run creates a `scan_report_YYYY-MM-DD_HH-MM-SS.md` file containing:
+Expected diagnostic log tags you may see:
+- `[WARNING] Environment mismatch` (top of run) — not inside venv311 or Python isn't 3.11. Run still proceeds.
+- `[Safety] Mechanical detector tagged N off-domain elements` — origin comparison fired normally.
+- `[Navigator] Invalid response on attempt N: ...` — AI replied with invalid JSON or wrong-page hallucination; auto-retry in progress.
+- `[Fallback] AI decision unavailable — applying mechanical tags + progress tiebreak.` — AI failed after 2 retries; mechanical tags apply plus finish/submit/checkout-like keywords biased to weight 8.
+- `[StaleScore] ... re-asking AI.` — cached score expired due to workflow progress; fresh call made.
+- `[Locator] No selector matched '<X>' before attempt...` — element's labeled source hint couldn't be resolved before the attempt; generic fallbacks tried; expect possible failure.
+- `[Overlay] Click on '<X>' was blocked — attempting recovery.` — Playwright timeout on first click; overlay cleanup ran, then one retry.
+- `[LoopGuard] Last action '<X>' produced no state change. Penalizing: old -> new.` — same node after click, heavy penalty applied.
+- `[Error] Traversal Boundary Blocked: ...` — click/scroll failed, edge weight set to 999 so it is never retried.
 
-1. **Metadata Header** — Timestamp, target site, status (SUCCESS/FAILED)
-2. **Objective** — The `ai_context` goal passed to the agent
-3. **Summary Metrics Table** — Total transitions, unique nodes discovered
-4. **Execution Trajectory Table** — Step-by-step log with columns:
+### Markdown Report Contents
+Each run creates a `scan_report_YYYY-MM-DD_HH-MM-SS.md` file with:
+1. **Header** — timestamp, site name, SUCCESS/FAILED status banner
+2. **Objective** — raw `ai_context` goal string used
+3. **Summary Metrics Table** — total transitions executed, unique nodes discovered
+4. **Execution Trajectory Table** with columns:
    - Step number
-   - Source node hash (unique state ID)
-   - Current URL (clickable link)
-   - Action / button clicked (edge traversed)
-   - Assigned heuristic path cost
+   - Source node hash (unique 10-char state signature)
+   - Current URL (hyperlink)
+   - Action/element clicked
+   - Assigned path cost at the time of traversal
 
-**Status Codes**:
+### Final Status Codes
 | Status | Meaning |
-|--------|---------|
-| `SUCCESS_TARGET_REACHED` | Victory condition matched (text or URL) before max depth |
-| `MAX_DEPTH_EXHAUSTED` | Completed 25 steps without hitting victory condition |
-| `GRAPH_COMPLETELY_EXHAUSTED` | Visited all reachable nodes, no unvisited edges left |
-| (Early exit) | Authentication failed or config error |
+|---|---|
+| `SUCCESS_TARGET_REACHED` | A victory condition (text match OR URL substring) fired before `max_search_depth` was exhausted. |
+| `MAX_DEPTH_EXHAUSTED` | All 25 search steps executed without hitting any victory condition. Report still generated. |
+| `GRAPH_COMPLETELY_EXHAUSTED` | No unvisited / non-failed edges remained AND breadcrumb back-history was empty. No way to continue exploring. |
+| *(Early exit)* | `sites_config.json` missing / malformed, or Playwright authentication crashed before entering the exploration loop. |
 
 ---
 
 ## Troubleshooting
 
-### Common Issues & Solutions
+### Missing `sites_config.json`
+**Symptom**: `[Error] The file 'sites_config.json' was not found in the working directory.`
 
----
-
-####  `[Error] The file 'sites_config.json' was not found`
-**Cause**: Agent is run from a different working directory.
-**Fix**:
+**Fix**: Run the script from the directory the file lives in. The code uses relative paths.
 ```powershell
-# Windows: Ensure you CD to the project folder first
+# Windows PowerShell
 cd "C:\full\path\to\web testing tool"
 python automation_engine.py
 ```
-Or pass an absolute path by modifying line 87 in `automation_engine.py`.
+If you need to run from another directory, edit the `open("sites_config.json")` call near the top of `run_pathfinder_agent()` (`automation_engine.py:376`) to an absolute path.
 
----
+### Ollama / Model Connectivity
+**Symptoms**: repeated silent `[Fallback]` log messages, slow navigation, no smart prioritization.
 
-####  Ollama Connection Errors (timeouts, model not found)
-**Symptoms**:
-- `ollama.chat()` exceptions silently swallowed (returns `{}` — all edges default to cost 2)
-- Console shows repeated slow navigation without smart prioritization
-
-**Diagnostics**:
+**Diagnostics (run in order)**:
 ```bash
-# 1. Is Ollama service running?
+# 1. Ollama service running?
 ollama ps
-# If error: start Ollama app (Win/Mac) or: sudo systemctl start ollama (Linux)
+# Windows: restart Ollama app. macOS: restart /Applications/Ollama.app.
+# Linux: sudo systemctl restart ollama.
 
-# 2. Is llama3.2 model downloaded?
+# 2. llama3.2 downloaded?
 ollama list
-# If missing: ollama pull llama3.2
+# If missing:
+ollama pull llama3.2
 
-# 3. Quick test of model inference
-ollama run llama3.2 "Hello, respond with just OK"
-# Type /bye to exit
+# 3. Smoke-test model inference:
+ollama run llama3.2 "Respond with only the word OK"
+# Type /bye to exit the interactive shell.
 ```
 
-**Fix**: Restart Ollama service, or if running on WSL2/certain Linux distros, set:
-```bash
-export OLLAMA_HOST=127.0.0.1:11434
-```
+If remote / WSL2 / custom-port Ollama: set env var `OLLAMA_HOST=127.0.0.1:11434` before launching.
 
----
-
-####  Playwright Errors: "Executable doesn't exist" / Browser Launch Failures
-**Fix**: Reinstall Playwright browsers:
+### Playwright Browser Launch Failures
+**Fix (inside activated venv)**:
 ```bash
-# Inside activated venv
 playwright install chromium
 
-# Linux extra step:
+# Linux required:
 sudo playwright install-deps chromium
 ```
 
-For **Windows** if that still fails:
+If Windows still fails:
 ```powershell
-# Force download all browsers
-playwright install
-# Or repair existing install:
 pip install --force-reinstall playwright
 playwright install chromium
 ```
 
----
-
-####  Authentication fails silently / "Root node authenticated" but logged out
-**Cause**: The CSS selector login button detection fails on your target site.
-
-**Fix**: Add the correct login button selectors to the `login_selectors` list on lines 123-124 of `automation_engine.py`. Example additions:
+### Authentication Failures ("Root node authenticated" printed but still on login screen)
+**Cause**: the 5-item `login_selectors` list didn't match the site's button. Edit `automation_engine.py` inside the login block (search for `login_selectors` in `run_pathfinder_agent()`) to append the correct CSS selectors for your site. Example:
 ```python
 login_selectors = [
     "#login-button", "input[type='submit']", "button[type='submit']",
     "button:has-text('Log In')", "button:has-text('Sign In')",
-    ".submit-btn", "#btn-login", "button.login"  # ← Add your site's selectors
+    ".submit-btn", "#btn-login", "button.primary-login",     # <-- append yours
 ]
 ```
 
----
+### Victory Condition Never Fires
+Run still ends with `MAX_DEPTH_EXHAUSTED` even though the agent visibly reached the goal page. Fix:
+1. Open devtools on the goal page → copy actual `<body>` innerText → verify your `text_matches` entry exists verbatim (match is case-insensitive substring)
+2. Match URLs against actual full URL, not the pretty path. URL matching is plain substring (not regex).
 
-####  Victory condition never triggers
-**Problem**: Agent reaches goal page but status still shows `MAX_DEPTH_EXHAUSTED`
+### Form Autofill Not Working
+1. Field must match one of the matched input types: `input[type='text']`, `input[type='number']`, `textarea`, `input:not([type])`. Password/email/hidden fields are intentionally skipped.
+2. Keywords in `sites_config.json` must appear (as lowercase substring) in the concatenation of the field's `placeholder + id + name` attributes. Add more keyword variants.
+3. If fields have no placeholder and use `<label>` elements only, you need to extend the autofill engine; the current code doesn't crawl for sibling/for-attribute labels.
 
-**Check** & Fix in `sites_config.json`:
-1. Ensure `text_matches` strings appear **exactly** (case-insensitive) in the page's `<body>` innerText
-2. URL substrings: do they appear in the actual URL? Open dev tools → copy URL → verify substring
-3. Escape special regex chars? No matching is plain substring, not regex
-
----
-
-####  Form autofill not working
-**Debug**:
-1. Check that field placeholder/id/name attributes contain one of your `keywords` entries
-2. Edit `sites_config.json` → add more keyword variations to each rule
-3. The agent fills only inputs that match `input[type='text'], input[type='number'], textarea, input:not([type])` — password/email/hidden are excluded
-
----
-
-####  Linux headless environment: "Browser closed" / Display errors
-**Option 1** (Recommended) — Run headless by editing `automation_engine.py:109`:
-```python
-browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
-```
-
-**Option 2** — Use Xvfb virtual display:
-```bash
-sudo apt install -y xvfb
-xvfb-run -a python automation_engine.py
-```
-
----
+### Linux Headless / Display-Related Crashes
+Two options:
+1. Edit `run_pathfinder_agent()` → change `headless=False` to `headless=True` on the `p.chromium.launch()` call.
+2. Install xvfb virtual buffer and prefix the command:
+   ```bash
+   sudo apt install -y xvfb
+   xvfb-run -a python automation_engine.py
+   ```
 
 ### Slow Performance Tips
-1. **Use smaller LLM**: If system has <8GB RAM, try `ollama pull llama3.2:1b` (1B params ~1.3GB) then edit line 35: `model='llama3.2:1b'`
-2. **Reduce max depth**: Change `max_search_depth` on line 148 from 25 to 15
-3. **Simplify element query**: Narrow `target_elements_query` in JSON (e.g., only primary buttons)
-4. **Faster storage**: Move Ollama model cache to SSD (default locations:
-   - Win: `C:\Users\<User>\.ollama\models`
-   - Mac: `~/.ollama/models`
-   - Linux: `/usr/share/ollama/.ollama/models`)
+1. Smaller LLM variant: if <8 GB RAM, use `ollama pull llama3.2:1b`, then edit `ask_ai_navigator()` (line 167) → `model='llama3.2:1b'`.
+2. Reduce `max_search_depth`: edit the `range(25)` to a smaller number in `run_pathfinder_agent()`.
+3. Narrow `target_elements_query` in `sites_config.json` (e.g., primary buttons only). Fewer elements = cheaper AI prompt, smaller state graph.
+4. Move Ollama model cache to SSD. Default locations: Win `%USERPROFILE%\.ollama\models`, Mac `~/.ollama/models`, Linux `/usr/share/ollama/.ollama/models`.
+
+### 30-Second Frozen Clicks / Scrolls (Should Not Happen Anymore)
+If you still see a >4 s click hang:
+1. Confirm `CLICK_ATTEMPT_TIMEOUT_MS = 4000` constant is still set.
+2. Confirm the freeze isn't actually in `safe_wait_for_load` after navigating to an external marketing site with never-ending ad network activity — external links should be heavily deprioritized by mechanical tags and rarely clicked in the first place.
 
 ---
 
 ## Network Diagnostics
 
-### Test Target Site Reachability (`netcheck.py`)
-Edit `netcheck.py` line 3 to point to your target URL, then run:
+### `netcheck.py`
+Edit the target URL inside `netcheck.py` (`url = "https://..."` on line 3), then:
 ```bash
 python netcheck.py
 # SUCCESS - Site is reachable. Status: 200
-#  OR
-# FAILED - Cannot reach site: <error details>
+#  — or —
+# FAILED - Cannot reach site: <exception details>
 ```
 
-### Test All Prerequisites
-Create a quick diagnostic script (save as `diag.py` and run) — or manually verify:
+### Manual Full Prerequisite Verification
 ```bash
-# Python + venv
+# Python / venv
 python --version
-which python   # (macOS/Linux)
-# Get-Command python  (Windows PowerShell) → should point to venv311
+# Windows PowerShell:
+Get-Command python    # Source column should point into venv311\Scripts
+# macOS / Linux:
+which python          # Path should end with venv311/bin/python
 
 # Core imports
 python -c "
-import ollama, playwright, json, asyncio, hashlib
-from playwright.async_api import async_playwright
-print(' All imports OK')
+import ollama, playwright, json, asyncio, hashlib, re, os, sys
+from datetime import datetime
+from playwright.async_api import async_playwright, TimeoutError
+print('All imports OK')
 "
 
-# Ollama
-ollama list | Select-String llama3.2    # PowerShell
-# ollama list | grep llama3.2           # macOS/Linux
+# Ollama model present
+ollama list | findstr llama3.2     # Windows
+# ollama list | grep llama3.2      # macOS / Linux
 ```
 
 ---
 
-## Uninstall / Cleanup
+## Reverting Changes (Backup Files)
 
-To fully remove the project from a device:
-1. Stop any running Python/Ollama processes
-2. Delete the project folder (removes venv and reports)
-3. (Optional) Uninstall Ollama (control panel / `brew uninstall ollama` / `sudo systemctl disable ollama && rm -rf /usr/share/ollama`)
-4. (Optional) Remove Playwright browser cache:
-   - Win: `%LOCALAPPDATA%\ms-playwright`
-   - Mac: `~/Library/Caches/ms-playwright`
-   - Linux: `~/.cache/ms-playwright`
+Two full byte-identical snapshots of `automation_engine.py` are included, taken before each round of code changes. You can fully restore any prior state with one file copy (no git required).
+
+| Backup File | Captured Before | Behavior Restored |
+|---|---|---|
+| `automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py` | The navigator refactor that added: full-page context injection, mechanical external detection, AI semantic `-1/-2` safety tags, and stale-score invalidation. | Reverts to the agent that still had click-locator fixes, overlay recovery, and futile-action penalties, but used the original blind button-list prompt with no safety tags and permanently cached scores. |
+| `automation_engine_BACKUP_BEFORE_FIXES_20260910.py` | The very first round of bug fixes (original baseline). | Original pre-bug-fix behavior: 30 s click timeouts, no overlay recovery, no locator hint chain, no idle anti-freeze on external sites, permanent AI score caching, zero safety tag system, and original short prompt. |
+
+**Revert Commands** (Windows PowerShell):
+```powershell
+cd "C:\path\to\web testing tool"
+
+# Option 1: revert to the version before context/safety-tags/stale-score refactor
+Copy-Item .\automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py .\automation_engine.py -Force
+
+# Option 2: fully revert to original baseline before any bug fixes
+Copy-Item .\automation_engine_BACKUP_BEFORE_FIXES_20260910.py .\automation_engine.py -Force
+```
+
+**Revert Commands** (macOS / Linux bash):
+```bash
+cd /path/to/web-testing-tool
+
+cp automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py automation_engine.py
+# or
+cp automation_engine_BACKUP_BEFORE_FIXES_20260910.py automation_engine.py
+```
+
+For *feature-level* reverts (disable one behavior without restoring the whole file) instead, edit the kill-switch constants documented in [Agent Behavior Tuning (Kill Switches)](#agent-behavior-tuning-kill-switches).
 
 ---
 
-## Migration Between Devices
-
-To move your working setup to a new machine:
-1. **Copy these files only** (everything except `venv311/`, `__pycache__/`, old reports):
-   - `automation_engine.py`
-   - `sites_config.json`
-   - `netcheck.py`
-   - `playwright_check.py`
-   - `requirements.txt`
-   - `.gitignore`
-2. On the new device, follow the platform-specific setup steps starting from **Step 3** (skip cloning)
-3. Re-create venv and reinstall dependencies — **never copy the `venv311/` folder across different OS/architectures**
-
----
-
-*Framework: Directed State-Graph Pathfinder Agent | Runtime: Python 3.11 + Playwright + Ollama Llama 3.2*
+*Framework: Directed State-Graph Pathfinder Agent | Runtime: Python 3.11 + Playwright 1.60.0 + Ollama Llama 3.2 navigator*
