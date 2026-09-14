@@ -72,6 +72,28 @@ RECENT_ACTIONS_MEMORY = 5
 # Expected runtime (warning-only — never blocks execution).
 EXPECTED_PYTHON_VERSION = (3, 11)
 EXPECTED_VENV_MARKER = "venv311"
+
+# Kill-switch: If False, flat int-only edge_weights (int cost per (node, edge)) are used
+# exactly like the original behavior and the new per-edge metadata objects below are
+# never created, recorded, or consulted. Set False for 100% pre-refactor behavior.
+ENABLE_EDGE_METADATA_TRACKING = True
+
+# Result-string constants used inside edge["last_result"]. Site-agnostic; no product or
+# site names are hardcoded anywhere — inferred mechanically from page/DOM signals only.
+RESULT_SUCCESS_NODE_CHANGED = "node_changed"
+RESULT_SUCCESS_SAME_NODE = "same_node_no_state_change"
+RESULT_FAILURE_CLICK_EXCEPTION = "click_exception"
+RESULT_FAILURE_NOT_VISIBLE = "element_not_visible"
+RESULT_FAILURE_SCROLL_TIMEOUT = "scroll_into_view_failed"
+RESULT_CART_COUNT_INCREASED = "cart_count_increased"    # inferred from .shopping_cart_badge text grow
+RESULT_CART_COUNT_DECREASED = "cart_count_decreased"    # inferred from badge shrink
+RESULT_FORM_SUBMITTED = "form_submitted"                 # inferred from input disappearing post-click
+RESULT_VICTORY_HIT = "victory_condition_match"
+
+# Success-rate thresholds for automatic penalties/blacklisting.
+EDGE_LOW_SUCCESS_THRESHOLD = 0.35          # success rate below this → extra penalty
+EDGE_CONSECUTIVE_FAILURE_BLACKLIST = 3     # 3 failures without any success → 999 blacklist
+
 # -----------------------------------------------------------------------------
 
 
@@ -94,6 +116,152 @@ def check_environment():
 def compute_node_hash(url, elements):
     state_string = f"{url}|{','.join(sorted(elements))}"
     return hashlib.md5(state_string.encode('utf-8')).hexdigest()[:10]
+
+
+def infer_action_type(element_text):
+    """Site-agnostic mechanical action-type classifier. Returns ADD_ITEM, NAV,
+    FORM_ACTION, REMOVE_ITEM, MODAL_ACTION, EXTERNAL_SOCIAL, UNKNOWN.
+    No product/site names hardcoded — works purely on token/pattern heuristics."""
+    text = element_text.lower().strip()
+    if any(tok in text for tok in ["add to cart", "add", "buy", "purchase", "select"]):
+        return "ADD_ITEM"
+    if any(tok in text for tok in ["checkout", "finish", "submit", "confirm", "save",
+                                   "continue", "next", "proceed", "place order", "pay"]):
+        return "FORM_ACTION"
+    if any(tok in text for tok in ["remove", "delete", "cancel", "reset", "clear", "undo"]):
+        return "REMOVE_ITEM"
+    if any(tok in text for tok in ["open menu", "close menu", "all items", "logout",
+                                   "log out", "sign out", "sign in", "log in",
+                                   "reset app state", "about"]):
+        return "MODAL_ACTION"
+    if any(tok in text for tok in ["twitter", "facebook", "linkedin", "instagram",
+                                   "youtube", "x.com", "tiktok", "github", "reddit"]):
+        return "EXTERNAL_SOCIAL"
+    if any(tok in text for tok in ["cart", "shopping cart", "back to products",
+                                   "continue shopping", "open"]):
+        return "NAV"
+    return "NAV"
+
+
+def create_edge_metadata(element_text):
+    """New-edge record. Shape matches the user-specified schema exactly but adds
+    AI_ranked_cost so the metadata object still tracks the LLM's subjective cost.
+    destination and last_result start as None until the click result is known."""
+    return {
+        "action": infer_action_type(element_text),
+        "element": element_text,
+        "attempts": 0,
+        "successes": 0,
+        "failures": 0,
+        "consecutive_failures": 0,
+        "last_result": None,
+        "destination": None,
+        "cost": 10,
+    }
+
+
+def record_edge_result(edge, success_bool, result_string, destination_node=None,
+                       updated_cost=None):
+    """Mutates edge dict in-place. Always increments attempts; on success bumps
+    successes and zeroes consecutive_failures; on failure bumps failures and
+    consecutive_failures. Updates destination / last_result / cost."""
+    edge["attempts"] += 1
+    edge["last_result"] = result_string
+    if destination_node is not None:
+        edge["destination"] = destination_node
+    if success_bool:
+        edge["successes"] += 1
+        edge["consecutive_failures"] = 0
+    else:
+        edge["failures"] += 1
+        edge["consecutive_failures"] += 1
+    if updated_cost is not None:
+        edge["cost"] = updated_cost
+
+
+def compute_current_edge_cost(edge, base_ai_cost):
+    """Returns the int cost for this edge given both its subjective base_ai_cost
+    (from LLM ranking / fallback defaults) and its empirical performance stats.
+    Mechanical rule, site-agnostic: low success rates and consecutive failures
+    drive cost UP; high success history modestly nudges cost DOWN."""
+    cost = int(base_ai_cost)
+    if not ENABLE_EDGE_METADATA_TRACKING:
+        return cost
+    if edge is None:
+        return cost
+    attempts = edge.get("attempts", 0)
+    if attempts <= 0:
+        return cost
+    successes = edge.get("successes", 0)
+    failures = edge.get("failures", 0)
+    last_result = edge.get("last_result")
+    consec = edge.get("consecutive_failures", 0)
+
+    success_rate = (successes / attempts) if attempts > 0 else 0.0
+
+    # Modest discount for edges that empirically work (≥2 attempts, >80% success).
+    if attempts >= 2 and success_rate >= 0.80:
+        cost = max(1, cost - 1)
+    # Steep penalty for edges with a very poor success track record.
+    if attempts >= 2 and success_rate < EDGE_LOW_SUCCESS_THRESHOLD:
+        cost += 30
+    # Penalty per consecutive failure pattern (stuck edge).
+    if consec >= 1:
+        cost += 5 * consec
+    # Hard blacklist if an edge is repeatedly failing without any success.
+    if consec >= EDGE_CONSECUTIVE_FAILURE_BLACKLIST and successes == 0:
+        return 999
+    # Specific last-result penalties.
+    if last_result in (RESULT_FAILURE_CLICK_EXCEPTION, RESULT_FAILURE_NOT_VISIBLE,
+                       RESULT_FAILURE_SCROLL_TIMEOUT):
+        cost += 10
+    if last_result == RESULT_SUCCESS_SAME_NODE:
+        cost += 25
+    if last_result == RESULT_VICTORY_HIT and successes >= 1:
+        cost = max(1, cost - 2)
+    if last_result == RESULT_CART_COUNT_INCREASED and successes >= 1:
+        cost = max(1, cost - 1)
+    if last_result == RESULT_CART_COUNT_DECREASED and successes >= 1:
+        cost += 10
+    # Safety ceiling (still <999 so explicit LLM #1 choice always wins override).
+    if cost > 998:
+        cost = 998
+    return cost
+
+
+def build_per_node_edge_performance_block(node_hash, edge_metadata_store,
+                                           available_elements, max_items=25):
+    """Returns a multi-line string describing empirical stats for every element
+    on the current node that has at least 1 prior attempt. Injected verbatim
+    into the LLM prompt context so the AI can see history BEFORE choosing."""
+    if not ENABLE_EDGE_METADATA_TRACKING:
+        return None
+    lines = []
+    count = 0
+    for elem in available_elements:
+        key = (node_hash, elem)
+        edge = edge_metadata_store.get(key)
+        if edge is None or edge["attempts"] == 0:
+            continue
+        rate = (100.0 * edge["successes"] / edge["attempts"]) if edge["attempts"] > 0 else 0.0
+        dest = edge["destination"] if edge["destination"] else "?"
+        lines.append(
+            f"  * '{elem}'  action={edge['action']}  attempts={edge['attempts']} "
+            f"successes={edge['successes']} failures={edge['failures']} "
+            f"success_rate={rate:.0f}% consecutive_failures={edge['consecutive_failures']} "
+            f"last_result={edge['last_result']} leads_to_node={dest} "
+            f"current_cost={edge['cost']}"
+        )
+        count += 1
+        if count >= max_items:
+            break
+    if not lines:
+        return None
+    return (
+        "PER_NODE_EDGE_PERFORMANCE_HISTORY (empirical stats from THIS run only; "
+        "prefer edges with higher success rates and avoid "
+        f"consecutive_failures≥2):\n" + "\n".join(lines)
+    )
 
 
 async def safe_wait_for_load(page, timeout_ms=8000):
@@ -132,7 +300,8 @@ def _validate_navigator_response(parsed, available_elements):
 def ask_ai_navigator(available_elements, goal, recent_actions,
                      page_url=None, page_title=None, page_text_snippet=None,
                      step_index=None, max_steps=None,
-                     mechanical_safety_tags=None):
+                     mechanical_safety_tags=None,
+                     edge_performance_block=None):
     """
     The ALL-NEW Navigator.
 
@@ -150,6 +319,12 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
     undo-progress action). Mechanical tags from element extraction are passed
     in as mechanical_safety_tags so the AI can see what the system ALREADY
     proved (e.g. "this is off-domain") and is less likely to misclassify.
+
+    When ENABLE_EDGE_METADATA_TRACKING is True AND edge_performance_block is
+    provided, the AI additionally sees EMPIRICAL PERFORMANCE HISTORY for each
+    element with prior attempts (attempts/successes/failures/success_rate/
+    last_result/leads_to_node/current_cost) so it can avoid edges with
+    known-poor success rates and prefer edges with proven outcomes.
     """
     if mechanical_safety_tags is None:
         mechanical_safety_tags = {}
@@ -180,8 +355,10 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
                     "mechanically proven external/destructive item to 0):\n"
                     + json.dumps({k: f"{v} ({t(v)})" for k, v in mt_preview.items()}, indent=2)
                 )
+        if edge_performance_block:
+            page_context_parts.append(edge_performance_block)
         if page_context_parts:
-            context_block = "\nCONTEXT ABOUT THE PAGE YOU ARE CURRENTLY ON (use this to avoid hallucinating buttons from previous pages):\n" + "\n".join(page_context_parts) + "\n"
+            context_block = "\nCONTEXT ABOUT THE PAGE YOU ARE CURRENTLY ON (use this to avoid hallucinating buttons from previous pages AND to prefer edges with empirically higher success rates):\n" + "\n".join(page_context_parts) + "\n"
 
     safety_tag_instruction = ""
     safety_tag_shape = ""
@@ -208,13 +385,14 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
         f"{context_block}\n"
         f"AVAILABLE CLICKABLE OPTIONS ON SCREEN:\n{available_elements}\n\n"
         "INSTRUCTIONS:\n"
-        "Given the CURRENT PAGE CONTEXT above, pick the ONE option that is the most logical NEXT STEP "
+        "Given the CURRENT PAGE CONTEXT above (including any empirical edge performance stats), pick the ONE option that is the most logical NEXT STEP "
         "TOWARD THE GOAL, taking into account what page you are on and how far through the workflow you already are. "
         "WARNING: It is a CRITICAL ERROR to pick a button that existed on a PREVIOUS page that has already been "
         "navigated past (e.g. do NOT say 'Continue' on the final review step where only 'Finish' and 'Cancel' exist — "
         "read the options list and page content carefully).\n\n"
         "Then rank the remaining options as backups, best first, in case the top choice fails to execute. "
-        "Give a one-sentence reason for your top choice.\n"
+        "Give a one-sentence reason for your top choice. If PER_NODE_EDGE_PERFORMANCE_HISTORY is present, "
+        "strongly deprioritize edges with consecutive_failures >= 2 OR success_rate < 50% unless no better option exists.\n"
         f"{safety_tag_instruction}\n"
         "Respond with ONLY a raw JSON object in exactly this shape:\n"
         '{"best_choice": "<exact text of one option>", '
@@ -444,11 +622,27 @@ async def run_pathfinder_agent():
         state_graph_metadata = {}  # node_hash -> {"first_score_action_count": N}
         state_graph = {}           # node_hash -> {} (preserved shape for len() metric)
         edge_weights = {}
+        # NEW: site-agnostic structured edge metadata. If ENABLE_EDGE_METADATA_TRACKING
+        # is False this dict exists but is never consulted (costs come from edge_weights).
+        edge_metadata_store = {}   # (node_hash, element_str) -> edge dict matching user schema
         node_breadcrumbs = []
         recent_actions_log = []
         pre_interaction_node = None
         pre_interaction_edge = None
+        # Mechanical observation values for result inference (page DOM signal snapshots).
+        prev_cart_badge = None
+        prev_form_input_count = None
         max_search_depth = 25
+
+        # Helper: if metadata enabled, ensure an edge dict exists and return it;
+        # if disabled, return None. Callers treat None as "no metadata path".
+        def get_or_create_edge(node, elem):
+            if not ENABLE_EDGE_METADATA_TRACKING:
+                return None
+            key = (node, elem)
+            if key not in edge_metadata_store:
+                edge_metadata_store[key] = create_edge_metadata(elem)
+            return edge_metadata_store[key]
 
         for step in range(max_search_depth):
             steps_taken = step + 1
@@ -457,10 +651,33 @@ async def run_pathfinder_agent():
 
             current_url = page.url
             current_ui_text = await page.evaluate("() => document.body.innerText")
+            # Mechanical signals used for last_result inference: cart badge count + visible form inputs.
+            # Runs on any site; no Sauce-specific CSS; missing selectors just give None.
+            try:
+                cart_badge_el = page.locator(".shopping_cart_badge").first
+                if await cart_badge_el.count() > 0 and await cart_badge_el.is_visible(timeout=500):
+                    cart_badge_text = (await cart_badge_el.text_content(timeout=800) or "").strip()
+                    current_cart_badge = int(cart_badge_text) if cart_badge_text.isdigit() else 0
+                else:
+                    current_cart_badge = 0
+            except Exception:
+                current_cart_badge = 0
+            try:
+                current_form_input_count = await page.locator(
+                    "input[type='text'], input[type='number'], textarea, input:not([type])"
+                ).count()
+            except Exception:
+                current_form_input_count = 0
 
             matched_text = any(msg.lower() in current_ui_text.lower() for msg in victory_text_matches)
             matched_url = any(sub.lower() in current_url.lower() for sub in victory_url_subs)
             if matched_text or matched_url:
+                # If there was a pre-interaction click that just produced victory, tag it as such.
+                if pre_interaction_node is not None and pre_interaction_edge is not None:
+                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
+                    if m is not None:
+                        record_edge_result(m, True, RESULT_VICTORY_HIT, None)
+                        m["destination"] = "VICTORY"
                 print(f"\n[SUCCESS] Targeted Destination Node Reached in {step} structural transitions!")
                 scan_status = "SUCCESS_TARGET_REACHED"
                 break
@@ -484,10 +701,36 @@ async def run_pathfinder_agent():
                 if tentative_current_node == pre_interaction_node:
                     old_cost = edge_weights.get((pre_interaction_node, pre_interaction_edge), 0)
                     edge_weights[(pre_interaction_node, pre_interaction_edge)] = old_cost + FUTILE_ACTION_PENALTY
+                    # Record in metadata as well (last_result = same node no-op).
+                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
+                    if m is not None:
+                        record_edge_result(m, False, RESULT_SUCCESS_SAME_NODE,
+                                           destination_node=tentative_current_node,
+                                           updated_cost=old_cost + FUTILE_ACTION_PENALTY)
                     print(f"[LoopGuard] Last action '{pre_interaction_edge}' produced no state change. "
                           f"Penalizing: {old_cost} -> {old_cost + FUTILE_ACTION_PENALTY}")
+                else:
+                    # Last click DID change the node. Optionally: compute cart badge delta
+                    # and inferred last_result (cart up/down).
+                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
+                    if m is not None:
+                        inferred = RESULT_SUCCESS_NODE_CHANGED
+                        if prev_cart_badge is not None:
+                            if current_cart_badge > prev_cart_badge:
+                                inferred = RESULT_CART_COUNT_INCREASED
+                            elif current_cart_badge < prev_cart_badge:
+                                inferred = RESULT_CART_COUNT_DECREASED
+                        elif prev_form_input_count is not None and current_form_input_count < prev_form_input_count:
+                            inferred = RESULT_FORM_SUBMITTED
+                        # Current cost (may have been post-click bumped by +=2 previously):
+                        new_cost = edge_weights.get((pre_interaction_node, pre_interaction_edge), m["cost"])
+                        record_edge_result(m, True, inferred,
+                                           destination_node=tentative_current_node,
+                                           updated_cost=new_cost)
                 pre_interaction_node = None
                 pre_interaction_edge = None
+            prev_cart_badge = current_cart_badge
+            prev_form_input_count = current_form_input_count
 
             # --- EXTRACT ELEMENTS + MECHANICAL SAFETY TAGS -----------------
             # Site-agnostic external-link detection uses window.location.origin
@@ -594,6 +837,16 @@ async def run_pathfinder_agent():
                         state_graph_metadata[current_node]["first_score_action_count"] = current_count
                         need_ai_call = True
 
+            # Build the empirical performance block BEFORE asking the AI, so the
+            # LLM can see attempts/successes/failures and avoid known-bad edges.
+            per_node_perf_block = build_per_node_edge_performance_block(
+                current_node, edge_metadata_store, available_elements
+            )
+            if per_node_perf_block:
+                # Short print so user sees that it's being consulted.
+                n_lines = per_node_perf_block.count("\n")
+                print(f"[EdgeMemory] Found {n_lines} elements with prior empirical performance history on this node.")
+
             if need_ai_call:
                 # Apply the IRREVERSIBLE hard block (original logic) before anything else.
                 irreversible_blocklist = [
@@ -607,6 +860,13 @@ async def run_pathfinder_agent():
                 for e in available_elements:
                     if e not in safe_elements:
                         edge_weights[(current_node, e)] = 999
+                        m = get_or_create_edge(current_node, e)
+                        if m is not None:
+                            m["cost"] = 999
+
+                # Ensure metadata records exist (for performance tracking in AI prompt):
+                for e in safe_elements:
+                    get_or_create_edge(current_node, e)
 
                 # Gather FULL PAGE CONTEXT for the AI (only when enabled):
                 page_title = None
@@ -630,16 +890,23 @@ async def run_pathfinder_agent():
                     step_index=step,
                     max_steps=max_search_depth,
                     mechanical_safety_tags=mechanical_safety_tags,
+                    edge_performance_block=per_node_perf_block,
                 )
 
                 ai_ranked = set()
                 if decision is not None:
                     ai_ranked.add(decision["best_choice"])
                     edge_weights[(current_node, decision["best_choice"])] = 1
+                    m_best = get_or_create_edge(current_node, decision["best_choice"])
+                    if m_best is not None:
+                        m_best["cost"] = 1
                     for rank, edge in enumerate(decision.get("ranked_backup", []), start=2):
                         if edge in safe_elements:
                             edge_weights[(current_node, edge)] = rank
                             ai_ranked.add(edge)
+                            m_r = get_or_create_edge(current_node, edge)
+                            if m_r is not None:
+                                m_r["cost"] = rank
 
                     # --- Apply SAFETY TAGS (MECHANICAL wins over AI) --------
                     # Priority order:
@@ -662,16 +929,21 @@ async def run_pathfinder_agent():
                                 final_tag = ai_tag
                             if final_tag == SAFETY_EXTERNAL_SITE and e not in ai_ranked:
                                 edge_weights[(current_node, e)] = COST_FOR_SAFETY_EXTERNAL
+                                m_s = get_or_create_edge(current_node, e)
+                                if m_s is not None:
+                                    m_s["cost"] = COST_FOR_SAFETY_EXTERNAL
                             elif final_tag == SAFETY_DESTRUCTIVE and e not in ai_ranked:
                                 edge_weights[(current_node, e)] = COST_FOR_SAFETY_DESTRUCTIVE
+                                m_s = get_or_create_edge(current_node, e)
+                                if m_s is not None:
+                                    m_s["cost"] = COST_FOR_SAFETY_DESTRUCTIVE
 
                     # --- Default for unranked non-tagged elements ----------
                     for e in safe_elements:
-                        if e not in edge_weights or (current_node, e) not in edge_weights:
-                            edge_weights.setdefault((current_node, e), 10)
-                        else:
-                            edge_weights.setdefault((current_node, e), edge_weights.get((current_node, e), 10))
-                    # Ensure unranked have a default fallback 10 if nothing set
+                        edge_weights.setdefault((current_node, e), 10)
+                        m_s = get_or_create_edge(current_node, e)
+                        if m_s is not None and (current_node, e) in edge_weights:
+                            m_s["cost"] = edge_weights[(current_node, e)]
                     for e in safe_elements:
                         if e not in ai_ranked and e not in mechanical_safety_tags:
                             aitag = 0
@@ -679,6 +951,9 @@ async def run_pathfinder_agent():
                                 aitag = decision["safety_tags"].get(e, 0)
                             if aitag == 0:
                                 edge_weights.setdefault((current_node, e), 10)
+                                m_s = get_or_create_edge(current_node, e)
+                                if m_s is not None:
+                                    m_s["cost"] = edge_weights.setdefault((current_node, e), m_s["cost"])
                 else:
                     # Fallback — AI failed twice. Use mechanical + generic progress hints.
                     print("[Fallback] AI decision unavailable — applying mechanical tags + progress tiebreak.")
@@ -689,15 +964,29 @@ async def run_pathfinder_agent():
                     for e in safe_elements:
                         mec_tag = mechanical_safety_tags.get(e, 0)
                         if mec_tag == SAFETY_EXTERNAL_SITE:
-                            edge_weights.setdefault((current_node, e), COST_FOR_SAFETY_EXTERNAL)
+                            c = COST_FOR_SAFETY_EXTERNAL
                         elif mec_tag == SAFETY_DESTRUCTIVE:
-                            edge_weights.setdefault((current_node, e), COST_FOR_SAFETY_DESTRUCTIVE)
+                            c = COST_FOR_SAFETY_DESTRUCTIVE
                         elif any(k in e.lower() for k in progress_keywords):
-                            edge_weights.setdefault((current_node, e), 8)
+                            c = 8
                         else:
-                            edge_weights.setdefault((current_node, e), 10)
+                            c = 10
+                        edge_weights.setdefault((current_node, e), c)
+                        m_s = get_or_create_edge(current_node, e)
+                        if m_s is not None:
+                            m_s["cost"] = c
 
-            valid_edges = [edge for edge in available_elements if edge_weights.get((current_node, edge), 0) < 999]
+            # Final edge cost = min over available_elements of
+            # compute_current_edge_cost(metadata_edge_dict, base_subjective_cost).
+            # Subjective edge_weights stay intact so kill-switch = False still gives
+            # original behavior exactly.
+            def effective_cost(elem):
+                key = (current_node, elem)
+                base = edge_weights.get(key, 10)
+                meta = edge_metadata_store.get(key) if ENABLE_EDGE_METADATA_TRACKING else None
+                return compute_current_edge_cost(meta, base)
+
+            valid_edges = [edge for edge in available_elements if effective_cost(edge) < 999]
             if not valid_edges:
                 print(f"[Dead End] Node {current_node} fully exhausted. Backtracking...")
                 if node_breadcrumbs:
@@ -705,21 +994,24 @@ async def run_pathfinder_agent():
                     current_node = node_breadcrumbs.pop()
                     pre_interaction_node = None
                     pre_interaction_edge = None
+                    prev_cart_badge = None
+                    prev_form_input_count = None
                     continue
                 else:
                     print("[Error] Complete accessible graph workspace exhausted.")
                     scan_status = "GRAPH_COMPLETELY_EXHAUSTED"
                     break
 
-            best_edge = min(valid_edges, key=lambda e: edge_weights[(current_node, e)])
-            print(f"-> Traversing Edge: '{best_edge}' (Path Cost: {edge_weights[(current_node, best_edge)]})")
+            best_edge = min(valid_edges, key=effective_cost)
+            chosen_final_cost = effective_cost(best_edge)
+            print(f"-> Traversing Edge: '{best_edge}' (Path Cost: {chosen_final_cost})")
 
             trajectory_log.append({
                 "step": steps_taken,
                 "node": current_node,
                 "url": current_url,
                 "action": best_edge,
-                "cost": edge_weights[(current_node, best_edge)]
+                "cost": chosen_final_cost,
             })
             recent_actions_log.append(best_edge)
 
@@ -734,6 +1026,10 @@ async def run_pathfinder_agent():
                         raise RuntimeError(f"Element '{best_edge}' not visible after all selector fallbacks.")
                 except Exception as e:
                     edge_weights[(current_node, best_edge)] = 999
+                    m_fail = get_or_create_edge(current_node, best_edge)
+                    if m_fail is not None:
+                        record_edge_result(m_fail, False, RESULT_FAILURE_NOT_VISIBLE,
+                                           updated_cost=999)
                     pre_interaction_node = None
                     pre_interaction_edge = None
                     raise
@@ -741,17 +1037,42 @@ async def run_pathfinder_agent():
                     await locator.scroll_into_view_if_needed(timeout=CLICK_ATTEMPT_TIMEOUT_MS)
                 except PlaywrightTimeoutError:
                     edge_weights[(current_node, best_edge)] = 999
+                    m_fail = get_or_create_edge(current_node, best_edge)
+                    if m_fail is not None:
+                        record_edge_result(m_fail, False, RESULT_FAILURE_SCROLL_TIMEOUT,
+                                           updated_cost=999)
                     pre_interaction_node = None
                     pre_interaction_edge = None
                     raise RuntimeError(f"scroll_into_view timed out for '{best_edge}' — likely behind overlay or detached.")
                 await click_with_overlay_recovery(page, locator, best_edge)
                 node_breadcrumbs.append(pre_interaction_node)
-                edge_weights[(pre_interaction_node, best_edge)] += 2
+                # Subjective cost +2 base bump on successful click completion; actual
+                # performance-informed cost will be recomputed by compute_current_edge_cost
+                # on the NEXT iteration once we know what last_result + destination was.
+                bumped = edge_weights.get((pre_interaction_node, best_edge), 1) + 2
+                edge_weights[(pre_interaction_node, best_edge)] = bumped
+                m_ok = get_or_create_edge(pre_interaction_node, best_edge)
+                if m_ok is not None:
+                    m_ok["cost"] = bumped
             except Exception as edge_err:
                 print(f"[Error] Traversal Boundary Blocked: {edge_err}")
-                edge_weights[(current_node, best_edge)] = 999
+                final_fail_cost = 999
+                edge_weights[(current_node, best_edge)] = final_fail_cost
+                m_fail = get_or_create_edge(current_node, best_edge)
+                if m_fail is not None and m_fail.get("attempts", 0) > 0 and m_fail["last_result"] in (
+                    RESULT_FAILURE_NOT_VISIBLE, RESULT_FAILURE_SCROLL_TIMEOUT,
+                ):
+                    # Already recorded inside inner handlers — keep that result.
+                    m_fail["cost"] = final_fail_cost
+                elif m_fail is not None:
+                    record_edge_result(m_fail, False, RESULT_FAILURE_CLICK_EXCEPTION,
+                                       updated_cost=final_fail_cost)
 
         print("\n===== DIRECTED PATHFINDING TRANSACTION MATRIX COMPLETE =====")
+        if ENABLE_EDGE_METADATA_TRACKING:
+            n_with_history = sum(1 for ed in edge_metadata_store.values() if ed["attempts"] > 0)
+            print(f"[EdgeMemory] Post-run summary: {len(edge_metadata_store)} tracked edge records, "
+                  f"{n_with_history} with empirical history.")
         await browser.close()
         generate_scan_report(
             site_name=config.get("site_name", "Target Application"),
