@@ -95,6 +95,475 @@ EDGE_LOW_SUCCESS_THRESHOLD = 0.35          # success rate below this → extra p
 EDGE_CONSECUTIVE_FAILURE_BLACKLIST = 3     # 3 failures without any success → 999 blacklist
 
 # -----------------------------------------------------------------------------
+# STATE MANAGER (Mechanical, LLM-free)
+#
+# Owns: current_state, previous_state, state_history, visited_nodes, transition_history
+# The LLM never writes to these structures — it only reads snapshots that the
+# StateManager explicitly exports (page context blocks, not direct dict access).
+# -----------------------------------------------------------------------------
+
+STATE_PHASE_INIT = "init"
+STATE_PHASE_AUTHENTICATED = "authenticated"
+STATE_PHASE_EXPLORATION = "exploration"
+STATE_PHASE_PRE_INTERACTION = "pre_interaction"
+STATE_PHASE_POST_INTERACTION = "post_interaction"
+STATE_PHASE_VICTORY = "victory"
+STATE_PHASE_BACKTRACK = "backtrack"
+STATE_PHASE_EXHAUSTED = "exhausted"
+STATE_PHASE_ERROR = "error"
+
+
+class State:
+    """A single mechanical snapshot of the agent's environment.
+
+    Fully deterministic from page DOM + URL + step counters. The LLM may READ
+    a curated subset of these fields via the navigator prompt, but it never
+    constructs or mutates a State object.
+    """
+
+    __slots__ = (
+        "node_hash",
+        "url",
+        "page_title",
+        "available_elements",
+        "element_count",
+        "cart_badge_count",
+        "form_input_count",
+        "step_index",
+        "phase",
+        "timestamp",
+        "action_count_at_creation",
+        "victory_match",
+        "snapshot_notes",
+    )
+
+    def __init__(self, *, node_hash, url, page_title=None, available_elements=None,
+                 element_count=0, cart_badge_count=0, form_input_count=0,
+                 step_index=0, phase=STATE_PHASE_INIT,
+                 action_count_at_creation=0, victory_match=False,
+                 snapshot_notes=None):
+        self.node_hash = node_hash
+        self.url = url
+        self.page_title = page_title or ""
+        self.available_elements = list(available_elements) if available_elements else []
+        self.element_count = element_count if element_count else len(self.available_elements)
+        self.cart_badge_count = cart_badge_count
+        self.form_input_count = form_input_count
+        self.step_index = step_index
+        self.phase = phase
+        self.timestamp = datetime.now()
+        self.action_count_at_creation = action_count_at_creation
+        self.victory_match = victory_match
+        self.snapshot_notes = snapshot_notes or ""
+
+    def to_dict(self):
+        return {
+            "node_hash": self.node_hash,
+            "url": self.url,
+            "page_title": self.page_title,
+            "element_count": self.element_count,
+            "cart_badge_count": self.cart_badge_count,
+            "form_input_count": self.form_input_count,
+            "step_index": self.step_index,
+            "phase": self.phase,
+            "timestamp": self.timestamp.isoformat(),
+            "action_count_at_creation": self.action_count_at_creation,
+            "victory_match": self.victory_match,
+            "snapshot_notes": self.snapshot_notes,
+            "available_elements_count": len(self.available_elements),
+        }
+
+
+class Transition:
+    """Record of a single attempted state transition.
+
+    Mechanical: populated from (pre_state + chosen_edge + execution outcome)
+    only. LLM ranking decisions are recorded verbatim from the navigator's
+    return payload but the Transition object itself is assembled inside
+    StateManager.record_transition().
+    """
+
+    __slots__ = (
+        "sequence_id",
+        "source_node_hash",
+        "destination_node_hash",
+        "action_label",
+        "assigned_cost",
+        "outcome",
+        "last_result_tag",
+        "overlay_recovery_used",
+        "attempt_count_for_action",
+        "cart_delta",
+        "form_input_delta",
+        "timestamp",
+        "failure_reason",
+    )
+
+    def __init__(self, *, sequence_id, source_node_hash, action_label,
+                 assigned_cost, destination_node_hash=None, outcome="pending",
+                 last_result_tag=None, overlay_recovery_used=False,
+                 attempt_count_for_action=0, cart_delta=0, form_input_delta=0,
+                 failure_reason=None):
+        self.sequence_id = sequence_id
+        self.source_node_hash = source_node_hash
+        self.destination_node_hash = destination_node_hash
+        self.action_label = action_label
+        self.assigned_cost = assigned_cost
+        self.outcome = outcome  # success | failed_no_state_change | failed_click | backtracked | victory
+        self.last_result_tag = last_result_tag
+        self.overlay_recovery_used = overlay_recovery_used
+        self.attempt_count_for_action = attempt_count_for_action
+        self.cart_delta = cart_delta
+        self.form_input_delta = form_input_delta
+        self.timestamp = datetime.now()
+        self.failure_reason = failure_reason
+
+    def to_dict(self):
+        return {
+            "sequence_id": self.sequence_id,
+            "source_node_hash": self.source_node_hash,
+            "destination_node_hash": self.destination_node_hash,
+            "action_label": self.action_label,
+            "assigned_cost": self.assigned_cost,
+            "outcome": self.outcome,
+            "last_result_tag": self.last_result_tag,
+            "overlay_recovery_used": self.overlay_recovery_used,
+            "attempt_count_for_action": self.attempt_count_for_action,
+            "cart_delta": self.cart_delta,
+            "form_input_delta": self.form_input_delta,
+            "timestamp": self.timestamp.isoformat(),
+            "failure_reason": self.failure_reason,
+        }
+
+
+class VisitedNodeRecord:
+    """Mechanical ledger entry for a single discovered node hash.
+
+    This is the authoritative visited_nodes record — it replaces the previous
+    state_graph + state_graph_metadata split dicts and the ad-hoc
+    edge_metadata_store keys. Nothing else may claim a node is "visited".
+    """
+
+    __slots__ = (
+        "node_hash",
+        "first_seen_step",
+        "last_seen_step",
+        "visit_count",
+        "first_action_count",
+        "last_action_count",
+        "first_url",
+        "last_url",
+        "incoming_edges",
+        "outgoing_edges_attempted",
+        "outgoing_edges_succeeded",
+        "tagged_externals_count",
+    )
+
+    def __init__(self, *, node_hash, first_seen_step, first_action_count, first_url):
+        self.node_hash = node_hash
+        self.first_seen_step = first_seen_step
+        self.last_seen_step = first_seen_step
+        self.visit_count = 1
+        self.first_action_count = first_action_count
+        self.last_action_count = first_action_count
+        self.first_url = first_url
+        self.last_url = first_url
+        self.incoming_edges = set()
+        self.outgoing_edges_attempted = set()
+        self.outgoing_edges_succeeded = set()
+        self.tagged_externals_count = 0
+
+    def touch(self, step, action_count, url):
+        self.last_seen_step = step
+        self.visit_count += 1
+        self.last_action_count = action_count
+        self.last_url = url
+
+    def to_dict(self):
+        return {
+            "node_hash": self.node_hash,
+            "first_seen_step": self.first_seen_step,
+            "last_seen_step": self.last_seen_step,
+            "visit_count": self.visit_count,
+            "first_action_count": self.first_action_count,
+            "last_action_count": self.last_action_count,
+            "first_url": self.first_url,
+            "last_url": self.last_url,
+            "incoming_edges_count": len(self.incoming_edges),
+            "outgoing_attempted": sorted(self.outgoing_edges_attempted),
+            "outgoing_succeeded": sorted(self.outgoing_edges_succeeded),
+            "tagged_externals_count": self.tagged_externals_count,
+        }
+
+
+class StateManager:
+    """Authoritative, mechanical owner of the agent's state ledger.
+
+    Public slots that callers MAY read (not write):
+      .current_state      — State object for the most recent snapshot
+      .previous_state     — State object for the snapshot before current
+      .state_history      — list[State] in chronological order
+      .visited_nodes      — dict[node_hash -> VisitedNodeRecord]
+      .transition_history — list[Transition] in chronological order
+
+    Nothing else in the codebase is allowed to track "visited" or "previous"
+    independently. Kill-switches still exist for the NAVIGATION logic (AI
+    scoring, safety tags, etc.), but the LEDGER is the exclusive authority.
+    """
+
+    def __init__(self, max_search_depth):
+        self.max_search_depth = max_search_depth
+
+        # ---- The Five Pillars ------------------------------------------------
+        self.current_state = None
+        self.previous_state = None
+        self.state_history = []
+        self.visited_nodes = {}   # node_hash -> VisitedNodeRecord
+        self.transition_history = []  # list[Transition]
+        # ---------------------------------------------------------------------
+
+        self._transition_counter = 0
+        self._action_counter = 0  # distinct from step_index — counts every chosen edge
+        self._breadcrumb_stack = []  # kept as a mechanical mirror of go_back() calls
+        self._final_status = "RUNNING"
+
+    # ------------------------------------------------------------------ #
+    # Metadata helpers (read-only exports for the rest of the engine)    #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def steps_taken(self):
+        return len(self.transition_history)
+
+    @property
+    def unique_nodes_discovered(self):
+        return len(self.visited_nodes)
+
+    @property
+    def action_count(self):
+        return self._action_counter
+
+    @property
+    def breadcrumb_depth(self):
+        return len(self._breadcrumb_stack)
+
+    def get_visited_record(self, node_hash):
+        return self.visited_nodes.get(node_hash)
+
+    def was_visited_before(self, node_hash):
+        return node_hash in self.visited_nodes
+
+    def get_action_count_at_first_visit(self, node_hash):
+        rec = self.visited_nodes.get(node_hash)
+        return rec.first_action_count if rec else None
+
+    def actions_since_first_visit(self, node_hash):
+        rec = self.visited_nodes.get(node_hash)
+        if rec is None:
+            return 0
+        return self._action_counter - rec.first_action_count
+
+    def export_state_for_report(self):
+        return {
+            "final_status": self._final_status,
+            "total_transitions": self.steps_taken,
+            "unique_nodes": self.unique_nodes_discovered,
+            "state_history_count": len(self.state_history),
+            "transition_history_count": len(self.transition_history),
+            "current_node": self.current_state.node_hash if self.current_state else None,
+            "previous_node": self.previous_state.node_hash if self.previous_state else None,
+        }
+
+    def export_trajectory_table_rows(self):
+        rows = []
+        for t in self.transition_history:
+            src = self.visited_nodes.get(t.source_node_hash)
+            url = src.last_url if src else ""
+            rows.append({
+                "step": t.sequence_id,
+                "node": t.source_node_hash,
+                "url": url,
+                "action": t.action_label,
+                "cost": t.assigned_cost,
+            })
+        return rows
+
+    def export_visited_nodes_summary(self):
+        return [rec.to_dict() for rec in self.visited_nodes.values()]
+
+    # ------------------------------------------------------------------ #
+    # Core lifecycle mutators — the ONLY five ways to write state        #
+    # ------------------------------------------------------------------ #
+
+    def snapshot_initial(self, *, node_hash, url, page_title=None,
+                         available_elements=None, cart_badge_count=0,
+                         form_input_count=0, step_index=0,
+                         externals_count=0):
+        """Called exactly once: after authentication, first exploration snapshot."""
+        state = State(
+            node_hash=node_hash, url=url, page_title=page_title,
+            available_elements=available_elements,
+            cart_badge_count=cart_badge_count,
+            form_input_count=form_input_count,
+            step_index=step_index,
+            phase=STATE_PHASE_EXPLORATION,
+            action_count_at_creation=self._action_counter,
+            snapshot_notes="initial post-auth snapshot",
+        )
+        self._commit_state(state, externals_count=externals_count)
+        return state
+
+    def snapshot_before_action(self, *, node_hash, url, page_title=None,
+                               available_elements=None, cart_badge_count=0,
+                               form_input_count=0, step_index=0,
+                               externals_count=0, victory_match=False,
+                               snapshot_notes=""):
+        """Called at the TOP of each main-loop iteration, before any edge is chosen."""
+        notes = snapshot_notes
+        if victory_match:
+            phase = STATE_PHASE_VICTORY
+            notes = (notes + " | victory match detected").strip(" |")
+        else:
+            phase = STATE_PHASE_EXPLORATION
+        state = State(
+            node_hash=node_hash, url=url, page_title=page_title,
+            available_elements=available_elements,
+            cart_badge_count=cart_badge_count,
+            form_input_count=form_input_count,
+            step_index=step_index,
+            phase=phase,
+            action_count_at_creation=self._action_counter,
+            victory_match=victory_match,
+            snapshot_notes=notes,
+        )
+        self._commit_state(state, externals_count=externals_count)
+        return state
+
+    def record_intent(self, *, source_node_hash, action_label, assigned_cost):
+        """Called right after an edge is chosen, before the click attempt.
+
+        Opens a pending Transition. Returns the new sequence_id.
+        """
+        self._action_counter += 1
+        self._transition_counter += 1
+        t = Transition(
+            sequence_id=self._transition_counter,
+            source_node_hash=source_node_hash,
+            action_label=action_label,
+            assigned_cost=assigned_cost,
+            outcome="pending",
+        )
+        self.transition_history.append(t)
+
+        # Bookkeep the intent against the source node ledger
+        src_rec = self.visited_nodes.get(source_node_hash)
+        if src_rec is not None:
+            src_rec.outgoing_edges_attempted.add(action_label)
+
+        self._breadcrumb_stack.append(source_node_hash)
+        return t.sequence_id
+
+    def record_outcome(self, sequence_id, *, destination_node_hash, outcome,
+                       last_result_tag=None, cart_delta=0, form_input_delta=0,
+                       overlay_recovery_used=False, attempt_count_for_action=0,
+                       failure_reason=None):
+        """Called after the click attempt (success or failure). Finalises Transition."""
+        for t in reversed(self.transition_history):
+            if t.sequence_id == sequence_id:
+                t.destination_node_hash = destination_node_hash
+                t.outcome = outcome
+                t.last_result_tag = last_result_tag
+                t.cart_delta = cart_delta
+                t.form_input_delta = form_input_delta
+                t.overlay_recovery_used = overlay_recovery_used
+                t.attempt_count_for_action = attempt_count_for_action
+                t.failure_reason = failure_reason
+                # Node ledger bookkeeping
+                if outcome in ("success", "victory"):
+                    src_rec = self.visited_nodes.get(t.source_node_hash)
+                    if src_rec is not None:
+                        src_rec.outgoing_edges_succeeded.add(t.action_label)
+                    dst_rec = self.visited_nodes.get(destination_node_hash)
+                    if dst_rec is not None:
+                        dst_rec.incoming_edges.add(t.action_label)
+                elif outcome == "failed_no_state_change" and self._breadcrumb_stack:
+                    # Same-node no-op: pop the breadcrumb since we didn't move
+                    self._breadcrumb_stack.pop()
+                elif outcome in ("failed_click", "failed_not_visible", "failed_scroll"):
+                    if self._breadcrumb_stack:
+                        self._breadcrumb_stack.pop()
+                return t
+        return None
+
+    def record_backtrack(self, from_node_hash, to_node_hash, reason="dead_end"):
+        """Mechanical mirror of page.go_back(). Opens its own Transition."""
+        self._action_counter += 1
+        self._transition_counter += 1
+        t = Transition(
+            sequence_id=self._transition_counter,
+            source_node_hash=from_node_hash,
+            destination_node_hash=to_node_hash,
+            action_label=f"__BACKTRACK__:{reason}",
+            assigned_cost=999,
+            outcome="backtracked",
+            last_result_tag="backtrack",
+            failure_reason=reason,
+        )
+        self.transition_history.append(t)
+        # Pop twice: once for the push before the failed click, once for
+        # __BACKTRACK__ itself replacing that layer.
+        if self._breadcrumb_stack and self._breadcrumb_stack[-1] == from_node_hash:
+            self._breadcrumb_stack.pop()
+        # The backtrack destination is being re-entered; callers should call
+        # snapshot_before_action() after go_back() settles the page.
+        return t.sequence_id
+
+    def set_final_status(self, status):
+        """One-time write: SUCCESS_TARGET_REACHED / MAX_DEPTH_EXHAUSTED / etc."""
+        self._final_status = status
+
+    def pop_breadcrumb(self):
+        if self._breadcrumb_stack:
+            return self._breadcrumb_stack.pop()
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Internal commit helpers                                            #
+    # ------------------------------------------------------------------ #
+
+    def _commit_state(self, state, externals_count=0):
+        # Shift pointers BEFORE appending so pointers always match history indices
+        self.previous_state = self.current_state
+        self.current_state = state
+        self.state_history.append(state)
+
+        # --- The authoritative visited_nodes update ----------------------
+        node_hash = state.node_hash
+        if node_hash in self.visited_nodes:
+            self.visited_nodes[node_hash].touch(
+                state.step_index,
+                self._action_counter,
+                state.url,
+            )
+            if externals_count > self.visited_nodes[node_hash].tagged_externals_count:
+                self.visited_nodes[node_hash].tagged_externals_count = externals_count
+        else:
+            rec = VisitedNodeRecord(
+                node_hash=node_hash,
+                first_seen_step=state.step_index,
+                first_action_count=self._action_counter,
+                first_url=state.url,
+            )
+            rec.tagged_externals_count = externals_count
+            self.visited_nodes[node_hash] = rec
+
+        # Link last transition's destination if we can (mechanical, best-effort)
+        if self.transition_history and self.transition_history[-1].outcome == "pending":
+            # Caller should have record_outcome()d before snapshot, but guard anyway
+            pass
+
+
+# -----------------------------------------------------------------------------
 
 
 def check_environment():
@@ -564,9 +1033,20 @@ async def run_pathfinder_agent():
 
     print(f"[Initialization] Initializing Directed State-Graph Pathfinder Agent for: {config.get('site_name', 'Target App')}")
 
+    max_search_depth = 25
+
+    # ---------------------------------------------------------------------
+    # STATE MANAGER — authoritative mechanical ledger. LLM never writes here.
+    # Owns: current_state / previous_state / state_history /
+    #       visited_nodes / transition_history
+    # ---------------------------------------------------------------------
+    state_mgr = StateManager(max_search_depth=max_search_depth)
+
     scan_status = "MAX_DEPTH_EXHAUSTED"
-    trajectory_log = []
-    steps_taken = 0
+    # Backwards-compat read-only mirrors: populated from StateManager exports
+    # on the fly via property access. Kept for generate_scan_report() legacy
+    # call site; prefer state_mgr.export_trajectory_table_rows() in new code.
+    trajectory_log = None
 
     victory_text_matches = config.get("victory_conditions", {}).get("text_matches", [])
     victory_url_subs = config.get("victory_conditions", {}).get("url_substrings", [])
@@ -611,28 +1091,19 @@ async def run_pathfinder_agent():
             return
 
         # ---------------------------------------------------------------------
-        # NEW data structure: state_graph stores not just "visited? T/F" but
-        # also the LENGTH of recent_actions_log at the moment the node was
-        # FIRST (or last) scored. This is the STALE SCORE INVALIDATION engine.
-        # When we return to this node later, if recent_actions is longer by
-        # >= STALE_SCORE_REASK_THRESHOLD, we RERUN the AI — because the
-        # CONTEXT (workflow progress) has materially changed, and a cost=1
-        # assigned at step 2 is no longer a good cost at step 12.
+        # Edge cost & metadata ledgers — navigation-only concerns (not state).
+        # The STATE MANAGER owns the visited / transition / history ledgers;
+        # these dicts own purely how much an edge costs to try next time.
         # ---------------------------------------------------------------------
-        state_graph_metadata = {}  # node_hash -> {"first_score_action_count": N}
-        state_graph = {}           # node_hash -> {} (preserved shape for len() metric)
         edge_weights = {}
-        # NEW: site-agnostic structured edge metadata. If ENABLE_EDGE_METADATA_TRACKING
-        # is False this dict exists but is never consulted (costs come from edge_weights).
-        edge_metadata_store = {}   # (node_hash, element_str) -> edge dict matching user schema
-        node_breadcrumbs = []
-        recent_actions_log = []
-        pre_interaction_node = None
-        pre_interaction_edge = None
-        # Mechanical observation values for result inference (page DOM signal snapshots).
+        edge_metadata_store = {}   # (node_hash, element_str) -> edge dict (user schema)
+
+        # Mechanical DOM-signal snapshots for last_result inference (kept
+        # between loop iterations — these are NAVIGATION / scoring inputs,
+        # not authoritative state snapshots; state lives in state_mgr only).
         prev_cart_badge = None
         prev_form_input_count = None
-        max_search_depth = 25
+        pending_transition_seq = None  # sequence_id from record_intent()
 
         # Helper: if metadata enabled, ensure an edge dict exists and return it;
         # if disabled, return None. Callers treat None as "no metadata path".
@@ -644,15 +1115,89 @@ async def run_pathfinder_agent():
                 edge_metadata_store[key] = create_edge_metadata(elem)
             return edge_metadata_store[key]
 
+        # ---- State Manager: INITIAL post-auth snapshot --------------------
+        # Run a first-pass extract + hash so StateManager's 5 pillars are warm
+        # before the first loop iteration.
+        await safe_wait_for_load(page)
+        _init_url = page.url
+        _init_extract = await page.evaluate("""(args) => {
+            const [selectorQuery, enableMechanical] = args;
+            const elements = Array.from(document.querySelectorAll(selectorQuery));
+            const visible = elements.filter(el => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+            });
+            const labels = [];
+            const mechanical_safety_tags = {};
+            const pageOrigin = window.location.origin;
+            for (const el of visible) {
+                let label;
+                if (el.classList.contains('shopping_cart_link') || el.closest('.shopping_cart_link')) {
+                    label = 'Shopping Cart';
+                } else if (el.innerText && el.innerText.trim().length > 1) {
+                    label = el.innerText.trim();
+                } else if (el.value && String(el.value).trim().length > 1) {
+                    label = String(el.value).trim();
+                } else if (el.placeholder && String(el.placeholder).trim().length > 1) {
+                    label = String(el.placeholder).trim();
+                } else if (el.id && el.id.trim().length > 1) {
+                    label = el.id.trim();
+                } else {
+                    continue;
+                }
+                if (label.includes('btn_secondary')) continue;
+                if (!labels.includes(label)) {
+                    labels.push(label);
+                    if (enableMechanical) {
+                        const href = el.getAttribute && el.getAttribute('href');
+                        if (href && (href.startsWith('http:') || href.startsWith('https:') || href.startsWith('//'))) {
+                            try {
+                                const linkUrl = new URL(href, window.location.href);
+                                if (linkUrl.origin !== pageOrigin) {
+                                    mechanical_safety_tags[label] = -1;
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                }
+            }
+            return { labels, mechanical_safety_tags };
+        }""", [target_selectors, ENABLE_MECHANICAL_EXTERNAL_DETECTION])
+        _init_elements = _init_extract["labels"]
+        _init_externals = sum(1 for v in _init_extract.get("mechanical_safety_tags", {}).values() if v == SAFETY_EXTERNAL_SITE)
+        _init_hash = compute_node_hash(_init_url, _init_elements)
+        try:
+            _init_title = await page.title()
+        except Exception:
+            _init_title = None
+        try:
+            _cart = page.locator(".shopping_cart_badge").first
+            _init_cart = int((await _cart.text_content(timeout=600) or "").strip()) if await _cart.count() > 0 and await _cart.is_visible(timeout=400) else 0
+        except Exception:
+            _init_cart = 0
+        try:
+            _init_forms = await page.locator("input[type='text'], input[type='number'], textarea, input:not([type])").count()
+        except Exception:
+            _init_forms = 0
+        state_mgr.snapshot_initial(
+            node_hash=_init_hash, url=_init_url, page_title=_init_title,
+            available_elements=_init_elements, cart_badge_count=_init_cart,
+            form_input_count=_init_forms, step_index=0,
+            externals_count=_init_externals,
+        )
+        print(f"[StateMgr] Ledger initialized. Root node: {_init_hash} | "
+              f"visited_nodes={state_mgr.unique_nodes_discovered} | "
+              f"state_history={len(state_mgr.state_history)}")
+
         for step in range(max_search_depth):
-            steps_taken = step + 1
             await safe_wait_for_load(page)
             await asyncio.sleep(1.5)
 
             current_url = page.url
             current_ui_text = await page.evaluate("() => document.body.innerText")
-            # Mechanical signals used for last_result inference: cart badge count + visible form inputs.
-            # Runs on any site; no Sauce-specific CSS; missing selectors just give None.
+            # Mechanical DOM signals for last_result inference (scoring-only,
+            # NOT authoritative state — state is committed via StateManager).
             try:
                 cart_badge_el = page.locator(".shopping_cart_badge").first
                 if await cart_badge_el.count() > 0 and await cart_badge_el.is_visible(timeout=500):
@@ -669,75 +1214,7 @@ async def run_pathfinder_agent():
             except Exception:
                 current_form_input_count = 0
 
-            matched_text = any(msg.lower() in current_ui_text.lower() for msg in victory_text_matches)
-            matched_url = any(sub.lower() in current_url.lower() for sub in victory_url_subs)
-            if matched_text or matched_url:
-                # If there was a pre-interaction click that just produced victory, tag it as such.
-                if pre_interaction_node is not None and pre_interaction_edge is not None:
-                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
-                    if m is not None:
-                        record_edge_result(m, True, RESULT_VICTORY_HIT, None)
-                        m["destination"] = "VICTORY"
-                print(f"\n[SUCCESS] Targeted Destination Node Reached in {step} structural transitions!")
-                scan_status = "SUCCESS_TARGET_REACHED"
-                break
-
-            # --- Futile action / same-node penalty (from previous fix set) ---
-            if pre_interaction_node is not None and pre_interaction_edge is not None:
-                tentative_elements = await page.evaluate("""(selectorQuery) => {
-                    const elements = Array.from(document.querySelectorAll(selectorQuery));
-                    return [...new Set(elements.filter(el => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-                    }).map(el => {
-                        if (el.classList.contains('shopping_cart_link') || el.closest('.shopping_cart_link')) {
-                            return 'Shopping Cart';
-                        }
-                        return el.innerText.trim() || el.value || el.placeholder || el.id;
-                    }).filter(t => t && t.length > 1 && !t.includes('btn_secondary')))];
-                }""", target_selectors)
-                tentative_current_node = compute_node_hash(current_url, tentative_elements)
-                if tentative_current_node == pre_interaction_node:
-                    old_cost = edge_weights.get((pre_interaction_node, pre_interaction_edge), 0)
-                    edge_weights[(pre_interaction_node, pre_interaction_edge)] = old_cost + FUTILE_ACTION_PENALTY
-                    # Record in metadata as well (last_result = same node no-op).
-                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
-                    if m is not None:
-                        record_edge_result(m, False, RESULT_SUCCESS_SAME_NODE,
-                                           destination_node=tentative_current_node,
-                                           updated_cost=old_cost + FUTILE_ACTION_PENALTY)
-                    print(f"[LoopGuard] Last action '{pre_interaction_edge}' produced no state change. "
-                          f"Penalizing: {old_cost} -> {old_cost + FUTILE_ACTION_PENALTY}")
-                else:
-                    # Last click DID change the node. Optionally: compute cart badge delta
-                    # and inferred last_result (cart up/down).
-                    m = get_or_create_edge(pre_interaction_node, pre_interaction_edge)
-                    if m is not None:
-                        inferred = RESULT_SUCCESS_NODE_CHANGED
-                        if prev_cart_badge is not None:
-                            if current_cart_badge > prev_cart_badge:
-                                inferred = RESULT_CART_COUNT_INCREASED
-                            elif current_cart_badge < prev_cart_badge:
-                                inferred = RESULT_CART_COUNT_DECREASED
-                        elif prev_form_input_count is not None and current_form_input_count < prev_form_input_count:
-                            inferred = RESULT_FORM_SUBMITTED
-                        # Current cost (may have been post-click bumped by +=2 previously):
-                        new_cost = edge_weights.get((pre_interaction_node, pre_interaction_edge), m["cost"])
-                        record_edge_result(m, True, inferred,
-                                           destination_node=tentative_current_node,
-                                           updated_cost=new_cost)
-                pre_interaction_node = None
-                pre_interaction_edge = None
-            prev_cart_badge = current_cart_badge
-            prev_form_input_count = current_form_input_count
-
             # --- EXTRACT ELEMENTS + MECHANICAL SAFETY TAGS -----------------
-            # Site-agnostic external-link detection uses window.location.origin
-            # comparison — it works for EVERY website, zero keywords, 100%
-            # accuracy, zero LLM cost. Works for any <a href> that points
-            # off-domain (Twitter, FB, LinkedIn, About page to saucelabs.com,
-            # marketing trackers, everything).
             extract_result = await page.evaluate("""(args) => {
                 const [selectorQuery, enableMechanical] = args;
                 const elements = Array.from(document.querySelectorAll(selectorQuery));
@@ -793,14 +1270,150 @@ async def run_pathfinder_agent():
             available_elements = extract_result["labels"]
             element_hints = extract_result["hints"]
             mechanical_safety_tags = extract_result.get("mechanical_safety_tags", {})
-
-            if ENABLE_MECHANICAL_EXTERNAL_DETECTION and mechanical_safety_tags:
+            externals_count = sum(1 for v in mechanical_safety_tags.values() if v == SAFETY_EXTERNAL_SITE)
+            if ENABLE_MECHANICAL_EXTERNAL_DETECTION and externals_count > 0:
                 externals = [k for k, v in mechanical_safety_tags.items() if v == SAFETY_EXTERNAL_SITE]
-                if externals:
-                    print(f"[Safety] Mechanical detector tagged {len(externals)} off-domain elements: {externals}")
+                print(f"[Safety] Mechanical detector tagged {len(externals)} off-domain elements: {externals}")
 
             current_node = compute_node_hash(current_url, available_elements)
+
+            # --- VICTORY CHECK (before snapshot so the snapshot captures victory phase) ---
+            matched_text = any(msg.lower() in current_ui_text.lower() for msg in victory_text_matches)
+            matched_url = any(sub.lower() in current_url.lower() for sub in victory_url_subs)
+
+            # --- RESOLVE PENDING TRANSITION from previous iteration ---------
+            # If we had a record_intent() open, finalise it now that we know
+            # the post-click node hash, cart delta, and outcome class.
+            if pending_transition_seq is not None:
+                # last pending intent was from state_mgr.previous_state.node_hash
+                _prev_node_hash = state_mgr.previous_state.node_hash if state_mgr.previous_state else None
+                _prev_action = None
+                for _pt in reversed(state_mgr.transition_history):
+                    if _pt.sequence_id == pending_transition_seq:
+                        _prev_action = _pt.action_label
+                        break
+
+                if matched_text or matched_url:
+                    # Victory from the previous click
+                    cart_delta = (current_cart_badge - prev_cart_badge) if prev_cart_badge is not None else 0
+                    form_delta = (current_form_input_count - prev_form_input_count) if prev_form_input_count is not None else 0
+                    state_mgr.record_outcome(
+                        pending_transition_seq,
+                        destination_node_hash="VICTORY",
+                        outcome="victory",
+                        last_result_tag=RESULT_VICTORY_HIT,
+                        cart_delta=cart_delta,
+                        form_input_delta=form_delta,
+                    )
+                    # Also write VICTORY into the edge-metadata ledger for backwards compat
+                    if _prev_node_hash is not None and _prev_action is not None:
+                        _m = get_or_create_edge(_prev_node_hash, _prev_action)
+                        if _m is not None:
+                            record_edge_result(_m, True, RESULT_VICTORY_HIT, None)
+                            _m["destination"] = "VICTORY"
+                elif current_node == _prev_node_hash:
+                    # Futile action / same-node — heavy penalty
+                    _src = _prev_node_hash
+                    _act = _prev_action
+                    old_cost = 0
+                    if _src is not None and _act is not None:
+                        old_cost = edge_weights.get((_src, _act), 0)
+                        edge_weights[(_src, _act)] = old_cost + FUTILE_ACTION_PENALTY
+                        _m = get_or_create_edge(_src, _act)
+                        if _m is not None:
+                            record_edge_result(_m, False, RESULT_SUCCESS_SAME_NODE,
+                                               destination_node=current_node,
+                                               updated_cost=old_cost + FUTILE_ACTION_PENALTY)
+                    state_mgr.record_outcome(
+                        pending_transition_seq,
+                        destination_node_hash=current_node,
+                        outcome="failed_no_state_change",
+                        last_result_tag=RESULT_SUCCESS_SAME_NODE,
+                        cart_delta=0,
+                        form_input_delta=0,
+                        failure_reason="same_node_hash_after_click",
+                    )
+                    if _act is not None:
+                        print(f"[LoopGuard] Last action '{_act}' produced no state change. "
+                              f"Penalizing: {old_cost} -> {old_cost + FUTILE_ACTION_PENALTY}")
+                else:
+                    # State actually changed — infer and commit success
+                    inferred = RESULT_SUCCESS_NODE_CHANGED
+                    if prev_cart_badge is not None:
+                        if current_cart_badge > prev_cart_badge:
+                            inferred = RESULT_CART_COUNT_INCREASED
+                        elif current_cart_badge < prev_cart_badge:
+                            inferred = RESULT_CART_COUNT_DECREASED
+                    elif prev_form_input_count is not None and current_form_input_count < prev_form_input_count:
+                        inferred = RESULT_FORM_SUBMITTED
+                    cart_delta = (current_cart_badge - prev_cart_badge) if prev_cart_badge is not None else 0
+                    form_delta = (current_form_input_count - prev_form_input_count) if prev_form_input_count is not None else 0
+                    state_mgr.record_outcome(
+                        pending_transition_seq,
+                        destination_node_hash=current_node,
+                        outcome="success",
+                        last_result_tag=inferred,
+                        cart_delta=cart_delta,
+                        form_input_delta=form_delta,
+                    )
+                    # Also keep edge_metadata_store in sync (backwards-compat scoring)
+                    if _prev_node_hash is not None and _prev_action is not None:
+                        _m = get_or_create_edge(_prev_node_hash, _prev_action)
+                        if _m is not None:
+                            new_cost = edge_weights.get((_prev_node_hash, _prev_action), _m["cost"])
+                            record_edge_result(_m, True, inferred,
+                                               destination_node=current_node,
+                                               updated_cost=new_cost)
+                pending_transition_seq = None
+
+            # Now handle the victory BRANCH after resolving the pending transition
+            if matched_text or matched_url:
+                # --- STATE MANAGER: snapshot with victory phase -------------
+                try:
+                    _pg_title = await page.title()
+                except Exception:
+                    _pg_title = None
+                state_mgr.snapshot_before_action(
+                    node_hash=current_node, url=current_url, page_title=_pg_title,
+                    available_elements=available_elements,
+                    cart_badge_count=current_cart_badge,
+                    form_input_count=current_form_input_count,
+                    step_index=step,
+                    externals_count=externals_count,
+                    victory_match=True,
+                    snapshot_notes="victory condition match",
+                )
+                state_mgr.set_final_status("SUCCESS_TARGET_REACHED")
+                print(f"\n[SUCCESS] Targeted Destination Node Reached in {step} structural transitions!")
+                scan_status = "SUCCESS_TARGET_REACHED"
+                break
+
+            # --- STATE MANAGER: BEFORE-ACTION SNAPSHOT ----------------------
+            # Commits current_state / previous_state / state_history / visited_nodes
+            # This is the authoritative ledger write — nothing else writes these.
+            try:
+                _pg_title = await page.title()
+            except Exception:
+                _pg_title = None
+            state_mgr.snapshot_before_action(
+                node_hash=current_node, url=current_url, page_title=_pg_title,
+                available_elements=available_elements,
+                cart_badge_count=current_cart_badge,
+                form_input_count=current_form_input_count,
+                step_index=step,
+                externals_count=externals_count,
+                victory_match=False,
+            )
+            steps_taken = state_mgr.steps_taken  # authoritative counter
+
+            prev_cart_badge = current_cart_badge
+            prev_form_input_count = current_form_input_count
+
             print(f"\n[Node: {current_node}] URL: {current_url} | Active Structural Edges: {available_elements}")
+            print(f"[StateMgr] state_history={len(state_mgr.state_history)} | "
+                  f"visited_nodes={state_mgr.unique_nodes_discovered} | "
+                  f"transitions={state_mgr.steps_taken} | "
+                  f"prev_hash={state_mgr.previous_state.node_hash if state_mgr.previous_state else 'none'}")
 
             # --- Autofill forms ---
             form_inputs = await page.locator("input[type='text'], input[type='number'], textarea, input:not([type])").all()
@@ -818,23 +1431,24 @@ async def run_pathfinder_agent():
                             break
 
             # --- SCORING: decide if fresh AI call or use cached weights ----
-            # New STALE-SCORE logic: if (a) node was scored before, AND
-            # (b) enough workflow progress happened since (action count grew
-            # >= threshold), INVALIDATE cached weights by re-running the AI.
-            # Context is different now; old cost=1 is no longer valid.
+            # Authoritative action count lives in StateManager.action_count —
+            # the stale-score engine consults it via actions_since_first_visit().
             need_ai_call = False
-            if current_node not in state_graph:
-                state_graph[current_node] = {}
-                state_graph_metadata[current_node] = {"first_score_action_count": len(recent_actions_log)}
+            if not state_mgr.was_visited_before(current_node):
+                # First visit — always ask AI
                 need_ai_call = True
             else:
                 if ENABLE_STALE_SCORE_INVALIDATION:
-                    prev_count = state_graph_metadata[current_node]["first_score_action_count"]
-                    current_count = len(recent_actions_log)
-                    if current_count - prev_count >= STALE_SCORE_REASK_THRESHOLD:
-                        print(f"[StaleScore] Node {current_node} was scored at action-count={prev_count}, "
-                              f"now at action-count={current_count}. Context materially changed; re-asking AI.")
-                        state_graph_metadata[current_node]["first_score_action_count"] = current_count
+                    actions_since = state_mgr.actions_since_first_visit(current_node)
+                    if actions_since >= STALE_SCORE_REASK_THRESHOLD:
+                        _first_act = state_mgr.get_action_count_at_first_visit(current_node)
+                        print(f"[StaleScore] Node {current_node} was scored at action-count={_first_act}, "
+                              f"now at action-count={state_mgr.action_count}. "
+                              f"Context materially changed; re-asking AI.")
+                        # Re-stamp the first_action_count via a fresh ledger touch
+                        _rec = state_mgr.get_visited_record(current_node)
+                        if _rec is not None:
+                            _rec.first_action_count = state_mgr.action_count
                         need_ai_call = True
 
             # Build the empirical performance block BEFORE asking the AI, so the
@@ -880,10 +1494,17 @@ async def run_pathfinder_agent():
                     if len(current_ui_text or "") > 420:
                         page_text_snippet += "..."
 
+                # Read-only snapshot from StateManager for the AI prompt.
+                # The AI sees it but never writes back to the ledger directly.
+                _recent_actions_snapshot = [
+                    t.action_label for t in state_mgr.transition_history
+                    if not t.action_label.startswith("__BACKTRACK__")
+                ][-RECENT_ACTIONS_MEMORY:]
+
                 decision = ask_ai_navigator(
                     safe_elements,
                     config["ai_context"],
-                    recent_actions_log,
+                    _recent_actions_snapshot,
                     page_url=current_url,
                     page_title=page_title,
                     page_text_snippet=page_text_snippet,
@@ -989,15 +1610,19 @@ async def run_pathfinder_agent():
             valid_edges = [edge for edge in available_elements if effective_cost(edge) < 999]
             if not valid_edges:
                 print(f"[Dead End] Node {current_node} fully exhausted. Backtracking...")
-                if node_breadcrumbs:
+                _backtrack_from = current_node
+                _backtrack_to = state_mgr.pop_breadcrumb()
+                if _backtrack_to is not None:
+                    # Mechanical backtrack — record into transition_history
+                    state_mgr.record_backtrack(_backtrack_from, _backtrack_to, reason="dead_end_all_edges_999")
                     await page.go_back()
-                    current_node = node_breadcrumbs.pop()
-                    pre_interaction_node = None
-                    pre_interaction_edge = None
+                    # Reset DOM-signal snapshots because the new page is old history
                     prev_cart_badge = None
                     prev_form_input_count = None
+                    pending_transition_seq = None
                     continue
                 else:
+                    state_mgr.set_final_status("GRAPH_COMPLETELY_EXHAUSTED")
                     print("[Error] Complete accessible graph workspace exhausted.")
                     scan_status = "GRAPH_COMPLETELY_EXHAUSTED"
                     break
@@ -1006,18 +1631,19 @@ async def run_pathfinder_agent():
             chosen_final_cost = effective_cost(best_edge)
             print(f"-> Traversing Edge: '{best_edge}' (Path Cost: {chosen_final_cost})")
 
-            trajectory_log.append({
-                "step": steps_taken,
-                "node": current_node,
-                "url": current_url,
-                "action": best_edge,
-                "cost": chosen_final_cost,
-            })
-            recent_actions_log.append(best_edge)
+            # --- STATE MANAGER: record intent (opens pending Transition) ---
+            # This is the authoritative write to transition_history. The LLM
+            # did NOT touch these structures — its JSON output was pure input
+            # to the cost function above; the ledger mutation happens here.
+            pending_transition_seq = state_mgr.record_intent(
+                source_node_hash=current_node,
+                action_label=best_edge,
+                assigned_cost=chosen_final_cost,
+            )
 
+            _click_failed_outcome = None
+            _click_failed_reason = None
             try:
-                pre_interaction_node = current_node
-                pre_interaction_edge = best_edge
                 locator, resolved_ok = await build_locator_for_edge(page, best_edge, element_hints)
                 if not resolved_ok:
                     print(f"[Locator] No selector matched '{best_edge}' before attempt — will try generic but expect possible failure.")
@@ -1030,8 +1656,8 @@ async def run_pathfinder_agent():
                     if m_fail is not None:
                         record_edge_result(m_fail, False, RESULT_FAILURE_NOT_VISIBLE,
                                            updated_cost=999)
-                    pre_interaction_node = None
-                    pre_interaction_edge = None
+                    _click_failed_outcome = "failed_not_visible"
+                    _click_failed_reason = f"element_not_visible: {e}"
                     raise
                 try:
                     await locator.scroll_into_view_if_needed(timeout=CLICK_ATTEMPT_TIMEOUT_MS)
@@ -1041,17 +1667,15 @@ async def run_pathfinder_agent():
                     if m_fail is not None:
                         record_edge_result(m_fail, False, RESULT_FAILURE_SCROLL_TIMEOUT,
                                            updated_cost=999)
-                    pre_interaction_node = None
-                    pre_interaction_edge = None
+                    _click_failed_outcome = "failed_scroll"
+                    _click_failed_reason = "scroll_into_view_timeout"
                     raise RuntimeError(f"scroll_into_view timed out for '{best_edge}' — likely behind overlay or detached.")
                 await click_with_overlay_recovery(page, locator, best_edge)
-                node_breadcrumbs.append(pre_interaction_node)
-                # Subjective cost +2 base bump on successful click completion; actual
-                # performance-informed cost will be recomputed by compute_current_edge_cost
-                # on the NEXT iteration once we know what last_result + destination was.
-                bumped = edge_weights.get((pre_interaction_node, best_edge), 1) + 2
-                edge_weights[(pre_interaction_node, best_edge)] = bumped
-                m_ok = get_or_create_edge(pre_interaction_node, best_edge)
+                # Breadcrumb was pushed inside record_intent() already; mirror
+                # for the legacy edge_metadata ledger + cost bump on success.
+                bumped = edge_weights.get((current_node, best_edge), 1) + 2
+                edge_weights[(current_node, best_edge)] = bumped
+                m_ok = get_or_create_edge(current_node, best_edge)
                 if m_ok is not None:
                     m_ok["cost"] = bumped
             except Exception as edge_err:
@@ -1062,25 +1686,70 @@ async def run_pathfinder_agent():
                 if m_fail is not None and m_fail.get("attempts", 0) > 0 and m_fail["last_result"] in (
                     RESULT_FAILURE_NOT_VISIBLE, RESULT_FAILURE_SCROLL_TIMEOUT,
                 ):
-                    # Already recorded inside inner handlers — keep that result.
                     m_fail["cost"] = final_fail_cost
                 elif m_fail is not None:
                     record_edge_result(m_fail, False, RESULT_FAILURE_CLICK_EXCEPTION,
                                        updated_cost=final_fail_cost)
+                # Close out the pending Transition as failed in the ledger.
+                if _click_failed_outcome is None:
+                    _click_failed_outcome = "failed_click"
+                if _click_failed_reason is None:
+                    _click_failed_reason = str(edge_err)[:220]
+                state_mgr.record_outcome(
+                    pending_transition_seq,
+                    destination_node_hash=current_node,  # never moved
+                    outcome=_click_failed_outcome,
+                    last_result_tag=RESULT_FAILURE_CLICK_EXCEPTION,
+                    cart_delta=0,
+                    form_input_delta=0,
+                    failure_reason=_click_failed_reason,
+                )
+                pending_transition_seq = None
+
+        # --- End of main loop ----------------------------------------------
+        # Final bookkeeping: if we left the loop because max_search_depth was
+        # exhausted, stamp the StateManager final status accordingly.
+        if scan_status == "MAX_DEPTH_EXHAUSTED":
+            state_mgr.set_final_status("MAX_DEPTH_EXHAUSTED")
+        # Also guarantee that any still-pending transition is closed.
+        if pending_transition_seq is not None:
+            # This should not happen; loop exit with pending means last
+            # iteration didn't reach post-click resolution. Close defensively.
+            state_mgr.record_outcome(
+                pending_transition_seq,
+                destination_node_hash=(
+                    state_mgr.current_state.node_hash if state_mgr.current_state else None
+                ),
+                outcome="failed_click",
+                last_result_tag=RESULT_FAILURE_CLICK_EXCEPTION,
+                failure_reason="loop_exit_with_pending_transition",
+            )
+            pending_transition_seq = None
 
         print("\n===== DIRECTED PATHFINDING TRANSACTION MATRIX COMPLETE =====")
         if ENABLE_EDGE_METADATA_TRACKING:
             n_with_history = sum(1 for ed in edge_metadata_store.values() if ed["attempts"] > 0)
             print(f"[EdgeMemory] Post-run summary: {len(edge_metadata_store)} tracked edge records, "
                   f"{n_with_history} with empirical history.")
+        _ledger = state_mgr.export_state_for_report()
+        print(f"[StateMgr] Ledger summary: {json.dumps(_ledger, indent=2, default=str)}")
         await browser.close()
+
+        # ---- REPORT: authoritative data now comes from StateManager ----
+        report_trajectory_rows = state_mgr.export_trajectory_table_rows()
+        # Filter out mechanical __BACKTRACK__ pseudo-actions from the
+        # human-facing trajectory table (still preserved in transition_history).
+        report_rows_filtered = [
+            r for r in report_trajectory_rows
+            if not r["action"].startswith("__BACKTRACK__")
+        ]
         generate_scan_report(
             site_name=config.get("site_name", "Target Application"),
             target_goal=config["ai_context"],
             status=scan_status,
-            total_steps=steps_taken,
-            nodes_discovered=len(state_graph),
-            trajectory_log=trajectory_log
+            total_steps=len(report_rows_filtered),
+            nodes_discovered=state_mgr.unique_nodes_discovered,
+            trajectory_log=report_rows_filtered,
         )
 
 if __name__ == "__main__":
