@@ -5,3 +5,7 @@ __pycache__/
 
 # Generated Scan Reports
 scan_report_*.md
+recon_report_*.md
+
+# Persistent website memory (per-site, machine-local, never shared)
+recon_memory/

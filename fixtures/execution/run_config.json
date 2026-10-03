@@ -1,0 +1,18 @@
+{
+  "site_name": "Execution Fixture",
+  "portal_url": "fixtures/execution/index.html",
+  "ai_context": "Open the confirm dialog and dismiss it, then select the Editor role.",
+  "max_steps": 6,
+  "browser": {
+    "headless": true
+  },
+  "safety": {
+    "consequential_mode": "confirm"
+  },
+  "test_goal": {
+    "objective": "Report the selected role on the page",
+    "final_evidence": [
+      "Editor"
+    ]
+  }
+}

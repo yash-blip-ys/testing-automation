@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Execution Fixture</title>
+</head>
+<body>
+  <h1>Execution Fixture</h1>
+  <output id="log"></output>
+
+  <form id="profile" onsubmit="return submitProfile(event)">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text">
+
+    <label for="role">Role</label>
+    <select id="role" name="role">
+      <option value="admin">Administrator</option>
+      <option value="viewer">Viewer</option>
+      <option value="editor">Editor</option>
+    </select>
+
+    <label for="newsletter">Subscribe to newsletter</label>
+    <input id="newsletter" name="newsletter" type="checkbox">
+
+    <label for="mode-ex">Mode (ex)</label>
+    <input id="mode-ex" name="mode" type="radio" value="ex">
+    <label for="mode-nx">Mode (nx)</label>
+    <input id="mode-nx" name="mode" type="radio" value="nx" checked>
+
+    <button id="save" type="submit">Save</button>
+  </form>
+
+  <!-- Unreachable option list: proves a select failure is reported honestly
+       rather than silently falling back to some other value. -->
+  <label for="strict">Strict select (no fallback)</label>
+  <select id="strict" name="strict">
+    <option value="one">One</option>
+    <option value="two">Two</option>
+  </select>
+
+  <button id="open-dialog">Open confirm dialog</button>
+  <button id="open-alert">Open alert dialog</button>
+  <button id="nav-away">Navigate</button>
+
+  <!-- An irreversible control, for verifying the safety boundary stops in
+       front of one rather than in front of a merely ambiguous name. -->
+  <button id="delete-account">Delete Account</button>
+
+  <div id="status"></div>
+
+  <script>
+    function note(msg) {
+      document.getElementById('log').textContent += msg + ';';
+      var st = document.getElementById('status');
+      st.textContent = msg;
+      st.setAttribute('data-last', msg);
+    }
+    window.lastFormSubmit = null;
+    window.dialogOutcome = null;
+
+    function submitProfile(e) {
+      e.preventDefault();
+      var data = new FormData(e.target);
+      window.lastFormSubmit = {
+        username: data.get('username'),
+        role: data.get('role'),
+        newsletter: data.get('newsletter') === 'on',
+        mode: data.get('mode')
+      };
+      note('submitted:' + window.lastFormSubmit.username);
+      return false;
+    }
+
+    document.getElementById('open-dialog').addEventListener('click', function () {
+      window.dialogOutcome = window.confirm('Delete your account permanently?');
+      note('confirm:' + window.dialogOutcome);
+    });
+    document.getElementById('open-alert').addEventListener('click', function () {
+      window.alert('Something happened');
+      note('alert:ok');
+    });
+    document.getElementById('nav-away').addEventListener('click', function () {
+      note('navigating');
+      setTimeout(function () { window.location.href = 'page2.html'; }, 30);
+    });
+  </script>
+</body>
+</html>

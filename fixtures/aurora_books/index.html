@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Aurora Books</title>
+<style>
+  body { font-family: Georgia, serif; margin: 0; background: #f6f4ef; color: #2b2b2b; }
+  header { background: #2f4858; color: #fff; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+  header h1 { font-size: 1.3rem; margin: 0; }
+  main { max-width: 60rem; margin: 0 auto; padding: 1.5rem; }
+  .searchbar { display: flex; gap: .5rem; align-items: flex-end; flex-wrap: wrap; }
+  .field { display: flex; flex-direction: column; }
+  .field label { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  .field input, .field select { padding: .45rem; border: 1px solid #b9b3a6; border-radius: 3px; font: inherit; }
+  button { padding: .5rem 1rem; background: #2f4858; color: #fff; border: 0; border-radius: 3px; cursor: pointer; font: inherit; }
+  button.secondary { background: #8c8c8c; }
+  ul.results { list-style: none; padding: 0; }
+  ul.results li { background: #fff; border: 1px solid #ddd6c7; padding: .8rem; margin-bottom: .6rem; display: flex; justify-content: space-between; align-items: center; }
+  ul.results a { color: #2f4858; text-decoration: none; font-weight: 600; }
+  .tag { font-size: .75rem; padding: .15rem .5rem; border-radius: 999px; background: #dff0d8; color: #33691e; }
+  .tag.out { background: #f8d7da; color: #842029; }
+  .empty { background: #fff; border: 1px dashed #b9b3a6; padding: 1.2rem; text-align: center; }
+  dl { background: #fff; border: 1px solid #ddd6c7; padding: 1rem; }
+  dt { font-weight: 600; margin-top: .6rem; }
+  dd { margin: .15rem 0 0; }
+</style>
+</head>
+<body>
+<header><h1>Aurora Books</h1><span id="banner">Independent bookshop</span></header>
+<main id="app"></main>
+<script>
+const CATALOG = [
+  { id: 'dune',  title: 'Dune',               author: 'Frank Herbert',      year: 1965, price: 18.50, stock: 4 },
+  { id: 'emma',  title: 'Emma',               author: 'Jane Austen',        year: 1815, price: 9.99,  stock: 2 },
+  { id: 'neuromancer', title: 'Neuromancer',  author: 'William Gibson',     year: 1984, price: 14.25, stock: 0 },
+  { id: 'beloved',title: 'Beloved',           author: 'Toni Morrison',       year: 1987, price: 12.00, stock: 7 },
+  { id: 'solaris',title: 'Solaris',          author: 'Stanisław Lem',       year: 1961, price: 11.40, stock: 1 }
+];
+
+const state = { view: 'catalog', query: '', inStock: false, selected: null, searched: false };
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function matches(b){
+  const q = state.query.trim().toLowerCase();
+  const okQ = !q || b.title.toLowerCase().includes(q) || b.author.toLowerCase().includes(q);
+  const okS = !state.inStock || b.stock > 0;
+  return okQ && okS;
+}
+
+function render(){
+  const app = document.getElementById('app');
+  if (state.view === 'detail' && state.selected) {
+    const b = state.selected;
+    app.innerHTML = `
+      <section id="detail">
+        <button id="back" class="secondary">Back to results</button>
+        <h2 id="detail-title">${esc(b.title)}</h2>
+        <dl>
+          <dt>Author</dt><dd id="detail-author">${esc(b.author)}</dd>
+          <dt>Year</dt><dd id="detail-year">${b.year}</dd>
+          <dt>Price</dt><dd id="detail-price">$${b.price.toFixed(2)}</dd>
+          <dt>Availability</dt><dd id="availability">${b.stock > 0 ? `In stock (${b.stock} copies)` : 'Out of stock'}</dd>
+        </dl>
+      </section>`;
+    document.getElementById('back').addEventListener('click', () => { state.view='catalog'; render(); });
+    return;
+  }
+
+  const results = CATALOG.filter(matches);
+  const rows = results.map(b => `
+    <li>
+      <span><a href="#/book/${b.id}" data-book="${b.id}">${esc(b.title)}</a>
+      <small> — ${esc(b.author)}, $${b.price.toFixed(2)}</small></span>
+      <span class="tag ${b.stock>0?'':'out'}">${b.stock>0?'In stock':'Out of stock'}</span>
+    </li>`).join('');
+
+  app.innerHTML = `
+    <section id="catalog">
+      <form class="searchbar" id="searchform">
+        <div class="field">
+          <label for="q">Search by title or author</label>
+          <input id="q" name="q" type="text" placeholder="e.g. Dune">
+        </div>
+        <div class="field">
+          <label for="avail">Availability</label>
+          <select id="avail" name="availability">
+            <option value="all">All items</option>
+            <option value="in">In stock only</option>
+          </select>
+        </div>
+        <button type="submit" id="search">Search</button>
+      </form>
+      <h2 id="results-heading">Results</h2>
+      ${results.length
+        ? `<ul class="results" id="results">${rows}</ul>`
+        : `<p class="empty" id="empty">No results found for &quot;${esc(state.query)}&quot;.</p>`}
+    </section>`;
+
+  document.getElementById('searchform').addEventListener('submit', e => {
+    e.preventDefault();
+    state.query = document.getElementById('q').value;
+    state.searched = true;
+    render();
+  });
+  document.getElementById('avail').addEventListener('change', e => {
+    state.inStock = e.target.value === 'in';
+    render();
+  });
+  document.querySelectorAll('[data-book]').forEach(a => {
+    a.addEventListener('click', e => {
+      e.preventDefault();
+      const id = a.getAttribute('data-book');
+      state.selected = CATALOG.find(b => b.id === id) || null;
+      state.view = 'detail';
+      location.hash = '#/book/' + id;
+      render();
+    });
+  });
+}
+
+window.addEventListener('hashchange', () => {
+  const m = location.hash.match(/#\/book\/(.+)$/);
+  if (m) {
+    state.selected = CATALOG.find(b => b.id === m[1]) || null;
+    state.view = state.selected ? 'detail' : 'catalog';
+  } else {
+    state.view = 'catalog';
+  }
+  render();
+});
+
+if (location.hash.match(/#\/book\//)) {
+  const m = location.hash.match(/#\/book\/(.+)$/);
+  state.selected = CATALOG.find(b => b.id === m[1]) || null;
+  state.view = state.selected ? 'detail' : 'catalog';
+}
+render();
+</script>
+</body>
+</html>

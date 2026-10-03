@@ -1,0 +1,75 @@
+{
+  "site_name": "Sauce Demo (objective + final evidence)",
+  "portal_url": "https://www.saucedemo.com/",
+  "ai_context": "Log in, add two items to the cart, then complete checkout.",
+  "auth": {
+    "username_selector": "input[data-test='username']",
+    "password_selector": "input[data-test='password']",
+    "selectors": [
+      "button[type='submit']"
+    ]
+  },
+  "credentials": {
+    "username": "standard_user",
+    "password": "secret_sauce"
+  },
+  "semantic_signals": {
+    "cart_count_selector": ".shopping_cart_badge",
+    "form_values_selector": "input[type='text'], input[type='number'], textarea, input:not([type])"
+  },
+  "test_goal": {
+    "objective": "Add two items to the cart, then complete checkout.",
+    "max_steps": 30,
+    "evidence": {
+      "url_contains": [
+        "checkout-complete"
+      ],
+      "text_contains": [
+        "Thank you for your order"
+      ]
+    }
+  },
+  "victory_conditions": {
+    "text_matches": [
+      "Thank you for your order"
+    ],
+    "url_substrings": [
+      "checkout-complete"
+    ]
+  },
+  "form_autofill": [
+    {
+      "keywords": [
+        "first name"
+      ],
+      "value": "Ada"
+    },
+    {
+      "keywords": [
+        "last name"
+      ],
+      "value": "Lovelace"
+    },
+    {
+      "keywords": [
+        "zip"
+      ],
+      "value": "90210"
+    }
+  ],
+  "target_elements_query": "button, a, [role='button'], [role='link'], input[type='submit'], [onclick]",
+  "browser": {
+    "headless": true
+  },
+  "safety": {
+    "consequential_mode": "confirm",
+    "confirmations": [
+      "click:Checkout",
+      "submit:Continue",
+      "submit:Finish",
+      "click:Place Order",
+      "click:Reset App State",
+      "click:Subscribe to newsletter"
+    ]
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "_comment": [
+    "Deterministic shadow-replan fixtures. Each case is (proposal, replace_keys)",
+    "run against a plan seeded from OBJECTIVE on a known page. They exist so",
+    "the activation decision rests on reproducible inputs rather than on",
+    "whatever the model happened to produce during one live run.",
+    "",
+    "page.elements/page.url/page.text describe the observation passed to the",
+    "evaluator. None of these cases is adopted; would_adopt() is read-only."
+  ],
+
+  "objective": "Add two items to the cart, then complete checkout.",
+
+  "page": {
+    "elements": ["Open Menu", "Add to cart", "Add to cart #2",
+                 "View details for Sauce Labs Backpack", "Cart, empty"],
+    "url": "https://shop.test/inventory",
+    "text": "Products. Add to cart. Cart, empty."
+  },
+
+  "cases": [
+    {
+      "name": "historical_failure_checkout_replaced_by_visible_controls",
+      "why": "The regression this layer exists for: the planner restated controls already on screen, so the plan looked complete while checkout was never reached.",
+      "proposal": ["open the menu", "view details for backpack"],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": false,
+        "reason_contains": "future step",
+        "lost_outstanding": [],
+        "introduces_filler": true,
+        "would_add_steps": false
+      }
+    },
+    {
+      "name": "plausible_reroute_accepted",
+      "why": "A route toward a page that does not exist yet is a real next step. The guard must be discriminating, not blanket.",
+      "proposal": ["open the payment page"],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": true,
+        "lost_outstanding": ["complete checkout"],
+        "introduces_filler": false
+      }
+    },
+    {
+      "name": "unrelated_work_displaces_outstanding_requirement",
+      "why": "Documents the known limitation: replace_keys is trusted, so a proposal naming unrelated non-filler work can displace outstanding work. Pinned so the gap stays visible.",
+      "proposal": ["open the wishlist page"],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": true,
+        "lost_outstanding": ["complete checkout"],
+        "introduces_filler": false
+      }
+    },
+    {
+      "name": "safety_violating_route_refused",
+      "why": "A proposal must not introduce a route the executor's safety boundary would refuse to cross later.",
+      "proposal": ["bypass the login then finish checkout"],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": false,
+        "reason_contains": "future step"
+      }
+    },
+    {
+      "name": "quantity_contradiction_refused",
+      "why": "The objective says two items. A proposal may not quietly change the number the user asked for.",
+      "proposal": ["add three items to the cart"],
+      "replace_keys": ["add two items to the cart"],
+      "expect": {
+        "would_adopt": false
+      }
+    },
+    {
+      "name": "plan_growth_measured",
+      "why": "Activation must know whether proposals inflate the plan, since every extra step consumes the step budget.",
+      "proposal": ["open the payment page", "open the wishlist page",
+                   "open the gift options page"],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": true,
+        "would_add_steps": true
+      }
+    },
+    {
+      "name": "no_proposal_at_all",
+      "why": "A failed planner call must be measured, not treated as an adoption.",
+      "proposal": [],
+      "replace_keys": ["complete checkout"],
+      "expect": {
+        "would_adopt": false
+      }
+    }
+  ]
+}

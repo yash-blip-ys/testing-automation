@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Occlusion Fixture</title>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; }
+  main { padding: 16px; }
+  .panel {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 260px;
+    background: #222;
+    color: #fff;
+    padding: 16px;
+    transform: translateX(-100%);
+    transition: transform 120ms ease-in-out;
+    z-index: 10;
+  }
+  .panel.open { transform: translateX(0); }
+  /* Covers the product list only once the panel is open. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    display: none;
+    z-index: 5;
+  }
+  body.drawer-open .scrim { display: block; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Catalogue</h1>
+    <button id="open-sidebar" data-test="open-menu">Open Sidebar</button>
+    <ul>
+      <li>Sauce Labs Backpack <button data-test="add-to-cart">Buy Backpack</button></li>
+      <li>Sauce Labs Bike Light <button>Buy Bike Light</button></li>
+    </ul>
+    <p><a id="receipt-link" href="receipt.html">Receipt</a></p>
+  </main>
+
+  <div class="scrim"></div>
+  <nav class="panel" data-test="side-menu" aria-label="Side menu">
+    <button id="close-sidebar" data-test="close-menu">Close Sidebar</button>
+    <a href="#all">All Items</a>
+  </nav>
+
+<script>
+  const body = document.body;
+  const panel = document.querySelector('.panel');
+  document.getElementById('open-sidebar')
+    .addEventListener('click', () => {
+      panel.classList.add('open');
+      body.classList.add('drawer-open');
+    });
+  document.getElementById('close-sidebar')
+    .addEventListener('click', () => {
+      panel.classList.remove('open');
+      body.classList.remove('drawer-open');
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "site_name": "Local Fixture - Aurora Books",
+  "portal_url": "fixtures/aurora_books/index.html",
+  "ai_context": "Search the catalog for 'Dune', set availability to 'In stock only', open the Dune result, and verify the book detail page displays an Availability field.",
+  "auth": {},
+  "credentials": {},
+  "semantic_signals": {
+    "cart_count_selector": null,
+    "form_values_selector": "input[type='text'], input[type='number'], textarea, input:not([type])"
+  },
+  "test_goal": {
+    "objective": "Search the catalog for 'Dune', apply the in-stock filter, open the Dune result, and verify the detail page displays Availability.",
+    "max_steps": 25,
+    "evidence": {
+      "text_contains": ["Availability"],
+      "element_present": ["Availability"],
+      "text_not_contains": ["No results found", "Something went wrong"],
+      "steps_min": 2
+    }
+  },
+  "victory_conditions": {},
+  "form_autofill": [],
+  "target_elements_query": "button, a, [role='button'], [role='link'], input[type='submit'], [onclick]"
+}

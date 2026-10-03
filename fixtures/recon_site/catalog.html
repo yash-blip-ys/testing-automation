@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Catalog — Northwind Outfitters</title>
+</head>
+<body>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="about.html">About us</a>
+  </nav>
+  <h1>Catalog</h1>
+  <ul>
+    <li><a href="product.html?id=tent">Ridgeline Tent</a></li>
+    <li><a href="product.html?id=pack">Summit Pack</a></li>
+    <!-- Off-origin supplier link, present on a real catalog page. -->
+    <a href="https://supplier.example.com/stock">Supplier stock</a>
+  </ul>
+  <form action="subscribe.html" method="post">
+    <label for="email">Email for the newsletter</label>
+    <input id="email" name="email" type="text" placeholder="you@example.com">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password">
+    <button type="submit">Create account</button>
+  </form>
+</body>
+</html>

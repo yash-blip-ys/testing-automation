@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Northwind Outfitters</title>
+</head>
+<body>
+  <header>
+    <nav>
+      <a href="about.html">About us</a>
+      <a href="catalog.html">Catalog</a>
+      <a href="support.html">Support</a>
+      <!-- Consequential: reconnaissance must record this and not follow it. -->
+      <a href="checkout.html">Checkout</a>
+      <!-- Off-origin: recorded as unexplored, never followed. -->
+      <a href="https://partner.example.com/feed">Partner feed</a>
+      <!-- Not a page: must not consume the page budget. -->
+      <a href="mailto:hello@northwind.test">Email us</a>
+      <!-- Same target as /about.html: must fold into one relationship. -->
+      <a href="about.html#team">Our team</a>
+    </nav>
+  </header>
+
+  <h1>Northwind Outfitters</h1>
+  <p>Seasonal gear for every trail.</p>
+
+  <form id="search" action="search.html" method="get">
+    <label for="q">Search</label>
+    <input id="q" name="q" type="text" placeholder="tent, pack, boots">
+    <button type="submit" id="do-search">Search</button>
+  </form>
+
+  <footer>
+    <a href="catalog.html">Catalog</a>
+  </footer>
+</body>
+</html>

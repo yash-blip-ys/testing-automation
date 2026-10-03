@@ -12,6 +12,7 @@ An AI-powered autonomous web testing and pathfinding agent that uses directed st
   - [Linux Setup (Ubuntu/Debian)](#linux-setup-ubuntudebian)
 - [Configuration](#configuration)
 - [Running the Agent](#running-the-agent)
+- [Reconnaissance Mode (Site Mapping)](#reconnaissance-mode-site-mapping)
 - [Agent Behavior Tuning (Kill Switches)](#agent-behavior-tuning-kill-switches)
 - [Safety Tag System](#safety-tag-system)
 - [Stale Score Invalidation](#stale-score-invalidation)
@@ -316,6 +317,77 @@ sudo playwright install-deps chromium
 
 ---
 
+## Core Contracts
+
+These are the invariants the agent is built to keep. They are enforced in code
+and pinned by tests; the authoritative copy lives in the `automation_engine.py`
+module docstring.
+
+| Contract | Guarantee |
+|---|---|
+| **Objective** | What the user asked for. Set once from `test_goal.objective` or `--goal`. Exposed as a **read-only property** — no model, plan, or later code can change it during a run. |
+| **Explicit steps** | An **optional** ordered override (`test_goal.steps[]`). When present they are used verbatim and no runtime plan is built. A step completes only on observable evidence, never because it was attempted. |
+| **Runtime plan** | Intermediate requirements the agent *proposes* for an objective-only run. It may change, but it cannot redefine the objective and cannot decide that work was achieved. Replanning is **disabled in production**. |
+| **Final evidence** | The user's own success criteria (`test_goal.evidence`). The **only** source of PASS, and fully independent of the plan. An objective with no evidence block can never pass. |
+| **Uncertainty** | Both sub-goal paths return the same row shape, including `verifiable` / `unverifiable`, so "not yet" is never confused with "can never be verified". |
+| **User constraints** | **Partially implemented — read this row and the note below it.** Arbitrary natural-language boundaries are **not** parsed into a constraint model, so "stop before payment" is not understood as an instruction. What *is* implemented is a separate, mechanical gate: consequential actions are classified from the element and withheld until explicitly confirmed. |
+| **Task status** | `PASS` / `FAIL` / `BLOCKED` from evaluation. `BLOCKED` currently conflates "not yet" with "can never be verified". |
+
+#### What the safety boundary does and does not cover
+
+Two different things are often confused here, so both are stated explicitly.
+
+**Not implemented:** parsing arbitrary user-stated boundaries. Nothing reads
+"stop before payment", "don't submit anything over $50", or "only test the
+checkout page" and turns it into an enforced constraint. There is no general
+constraint model, and a natural-language boundary is **not** guaranteed to be
+understood or honoured. Do not rely on one.
+
+**Implemented** (`SafetyPolicy`, `automation_engine.py:2378`): a separate,
+mechanical gate that does not depend on understanding your wording.
+
+- **Classification is mechanical.** Consequential means committing, spending,
+  publishing, granting access, destroying, or communicating outward. It is
+  derived from the element's role, type, and observable form — never from how the
+  model phrased its choice. A step claiming "the user approved this" changes
+  nothing.
+- **Unknown means consequential.** A control the classifier does not positively
+  recognise as benign is treated as consequential, so a control that cannot be
+  read confidently — or a new control type — fails closed rather than open.
+- **Confirmation must be explicit and is scope-keyed.** A grant is recorded for
+  one `<operation>:<target>` pair and cannot drift to another action.
+- **Access-control challenges stop the run.** CAPTCHA and access-control markers
+  are detected and the run halts. There is no solving or bypass path.
+
+The practical limit: this gate protects against the agent taking a consequential
+action *without* confirmation. It cannot protect against an action you confirmed
+that your own words meant should not happen, because those words are not read.
+`tests/test_adversarial_safety.py` (44 tests) pins this behaviour.
+
+### CLI
+
+```
+python automation_engine.py [--config FILE] [--url URL] [--goal "text"] [--max-steps N]
+```
+
+These two cases behave differently, and the difference matters:
+
+- **A recognised flag given without its value** (`--url` with nothing after it) is
+  an error: the message is printed and **no run starts**.
+- **An unrecognised argument** — an unknown flag, or a bare positional — is
+  **reported** and then **currently ignored, and the run continues** without it.
+
+So a typo such as `--maxteps 20` will not stop the run; it will be reported and
+the run will proceed as if that flag had never been passed. Check the warning
+line before trusting a run that used a flag you were not sure of.
+
+Precedence: `--url` overrides `portal_url`; `--goal` sets `ai_context` and
+reaches `test_goal.objective` (never overwriting an explicitly authored
+objective); `--max-steps` overrides `test_goal.max_steps`. Malformed values
+warn and fall back rather than crashing the run.
+
+---
+
 ## Configuration
 
 All site-specific settings live in **`sites_config.json`**, which **must** be present in the working directory at script launch.
@@ -435,6 +507,94 @@ Typical runtime: 30 s – 3 min depending on site complexity and Llama response 
 
 ---
 
+## Reconnaissance Mode (Site Mapping)
+
+A **separate mode** that explores a site to build a map of its structure. It runs
+no task, shares no state with the task engine, and cannot influence a task run.
+
+```powershell
+# Map a site (no task, no model calls)
+.\venv311\Scripts\python.exe automation_engine.py --recon --url "https://example.com"
+
+# Bound the crawl
+.\venv311\Scripts\python.exe automation_engine.py --recon --url "https://example.com" `
+    --recon-max-pages 15 --recon-max-depth 2 --recon-max-seconds 120
+
+# Map and remember verified structure for later runs
+.\venv311\Scripts\python.exe automation_engine.py --recon --url "https://example.com" --recon-memory
+```
+
+A timestamped `recon_report_<date>.md` is written to the working directory.
+
+### Reconnaissance is read-only
+
+It navigates and observes. It never submits a form, fills a field, signs in,
+accepts a consent banner, or walks a checkout. Traversal is restricted to
+same-origin hyperlink navigation, which has no side effect. Anything that reads
+as a commitment is recorded as an unexplored area **with a reason** rather than
+followed.
+
+It stops safely — recording the area, not proceeding — at authentication, a
+consent gate, an access-control challenge, or a consequential control.
+
+### Budgets
+
+Every limit is declared up front and checked *before* the work it limits, so a
+run stops on a limit rather than discovering it exceeded one.
+
+| Budget | Default | Flag |
+|---|---|---|
+| Pages | 25 | `--recon-max-pages` |
+| Transitions | 60 | `--recon-max-transitions` |
+| Depth | 3 | `--recon-max-depth` |
+| Wall-clock seconds | 300 | `--recon-max-seconds` |
+| Model calls | 40 | *(budget enforced; the crawler is currently mechanical)* |
+| Stored content | 20 000 chars | — |
+
+### What the report does and does not claim
+
+The report lists pages/states visited, navigation relationships, forms found,
+actions deliberately not taken, unexplored areas with reasons, confidence, and
+the limits reached. It labels every relationship as **walked** (traversed,
+destination observed), **suggested** (link seen, never followed), or **not
+walked** (with a reason), and marks page *roles* as inferences.
+
+**It does not claim exhaustive discovery.** When a budget or a barrier ended the
+run, the report says so in those words.
+
+### Website memory
+
+`--recon-memory` stores verified, durable structure to one JSON file per site
+(`recon_memory/`, git-ignored). Memory is a **hint, never an authority**: the
+live observation always wins, stale entries are flagged and must be revalidated,
+and records carry the confidence and source observation that make them
+checkable.
+
+Memory refuses to store anything credential- or token-shaped, is keyed by site
+origin (plus optional namespace) so sites cannot read each other's facts, and
+supports `inspect()` / `clear()`.
+
+#### Choosing where memory lives
+
+`--recon-memory-dir DIR` overrides the location. Three things to know:
+
+- **The directory is created if it does not exist**, and memory is written there
+  exactly as asked. Nothing is silently relocated.
+- **A relative path resolves from the process working directory**, not from
+  wherever the tool is installed.
+- **Prefer a location outside the repository.** Memory holds per-site
+  reconnaissance data — which site was probed, its navigation and form shapes,
+  where it failed — about sites you do not own. If you must keep it inside the
+  repository, add it to `.gitignore`. When the directory resolves inside the
+  project and nothing ignores it, the tool warns once at startup; it still
+  writes where you told it to.
+
+**Memory is not currently consulted by task runs.** The measurement behind that
+decision — including why reordering cannot change the task loop's choice — is in
+[`RECON_ACTIVATION_DECISION.md`](RECON_ACTIVATION_DECISION.md).
+
+---
+
 ## Agent Behavior Tuning (Kill Switches)
 
 Every non-trivial behavior is controlled by a module-level constant at the **top of `automation_engine.py` (lines 19–74)**. No need to restore a backup file just to disable one feature — flip the constant.
@@ -524,21 +684,68 @@ now at action-count=10. Context materially changed; re-asking AI.
 
 ```
 web testing tool/
-├── automation_engine.py                    # Core agent (state graph, full-context AI navigator, safety tags, overlay recovery, stale invalidation, reporting)
-├── sites_config.json                       # User configuration (target site, credentials, goal, victory, autofill)
-├── requirements.txt                        # Pinned Python 3.11 dependency manifest (84 packages, playwright==1.60.0, ollama==0.6.2, etc.)
-├── netcheck.py                             # Diagnostics: HTTP GET to target URL, report reachability
-├── playwright_check.py                     # Diagnostics: placeholder Playwright smoke check
-├── agent_knowledge.json                    # (if ever created) reserved for persistent memories across runs
+├── automation_engine.py                    # [Shipped] Core agent (state graph, full-context AI navigator, safety tags, overlay recovery, stale invalidation, reporting)
+├── reconnaissance.py                       # [Shipped] Separate reconnaissance mode (budgeted site mapping, website graph, per-site memory, recon report)
+├── sites_config.json                       # [Shipped] User configuration (target site, credentials, goal, victory, autofill)
+├── requirements.txt                        # [Shipped] Pinned Python 3.11 dependency manifest (79 pinned packages, playwright==1.60.0, ollama==0.6.2)
+├── netcheck.py                             # [Shipped] Diagnostics: HTTP GET to target URL, report reachability
+├── playwright_check.py                     # [Shipped] Diagnostics: placeholder Playwright smoke check
+├── benchmark/                              # [Shipped] Independent validation harness — 19 files
+│   ├── specs.py                            #   7 benchmark cases with expected outcomes and ground truth
+│   ├── fixtures/                           #   7 local benchmark applications, one per case
+│   ├── runner.py / run_benchmark.py        #   Case execution and grading against independent oracles
+│   ├── repeat.py                           #   N repetitions per case from a clean state, classifies flaky vs consistent-wrong
+│   ├── efficiency.py                       #   Model-call and step-efficiency metrics
+│   ├── clean_checkout.py                   #   Git-index-aware release export, then runs the suite from it
+│   └── server.py / smoke.py / show_results.py / README.md
+├── fixtures/                               # [Shipped] Local offline fixtures — 17 files
+│   ├── recon_site/                         #   Static site for reconnaissance tests
+│   ├── aurora_books/ execution/ observation/ occlusion/   #   Static sites for task tests
+│   └── *_saucedemo.json, shadow_replan_cases.json, _demo_*.json
+├── tests/                                  # [Shipped] Test suite — 1,071 tests (1,062 offline + 9 browser-dependent)
+├── .gitignore                              # [Shipped] Ignores venv311/, __pycache__/, scan_report_*.md, recon_report_*.md, recon_memory/, *.pyc
+├── PART6_RELEASE_REPORT.md                 # [Shipped] Part 6 release report, findings and open items
+├── RECON_ACTIVATION_DECISION.md            # [Shipped] Part 5 reconnaissance activation decision
+├── REPLANNING_ACTIVATION_DECISION.md       # [Shipped] Part 4 replanning activation decision (production and shadow both off, measured)
+├── PART7_VALIDATION_PLAN.md                # [Shipped] Part 7 frozen independent validation protocol
+├── README.md                               # [Shipped] This document
+│
+├── recon_memory/                           # [Local] Per-site persistent website memory (gitignored, never shared between sites)
 ├── venv311/                                # [Local] Python 3.11 virtual environment — NEVER copy between devices/OS
 ├── __pycache__/                            # [Local] Python bytecode cache
-├── automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py   # Snapshot before navigator context + stale-score + safety-tag refactor
-├── automation_engine_BACKUP_BEFORE_FIXES_20260910.py                # Snapshot before the first bug-fix round (original baseline)
-├── scan_report_*.md                        # Generated execution reports (timestamped, auto-created, gitignored)
-├── report_*.txt                            # Sample stdout capture logs from previous runs
-├── .gitignore                              # Ignores venv311/, __pycache__/, scan_report_*.md, *.pyc
-└── README.md                               # This document
+├── scan_report_*.md                        # [Generated] Execution reports (timestamped, gitignored)
+├── recon_report_*.md                       # [Generated] Reconnaissance reports (timestamped, gitignored)
+├── recon_ab_probe.py                       # [Not shipped] One-off Part 5 measurement harness; excluded from the release export, no test imports it
+├── shadow_probe.py                         # [Not shipped] One-off shadow-replanning measurement harness; excluded from the release export, no test imports it
+├── automation_engine_BACKUP_BEFORE_CONTEXT_NEG_SCORES_20260910.py   # [Shipped] Snapshot before navigator context + stale-score + safety-tag refactor
+└── automation_engine_BACKUP_BEFORE_FIXES_20260910.py                # [Shipped] Snapshot before the first bug-fix round (original baseline)
 ```
+
+The `[Shipped]` / `[Local]` / `[Generated]` / `[Not shipped]` labels describe the
+Git-index-backed release export produced by `benchmark/clean_checkout.py`, not
+simply what happens to sit in the working directory. Two one-off measurement
+scripts (`recon_ab_probe.py`, `shadow_probe.py`) are deliberately **not** part of
+the release: no test or benchmark imports them, and their disposition is an open
+decision recorded in `PART6_RELEASE_REPORT.md`.
+
+### Test suite
+
+**1,071 tests, all passing**, split by what they actually require:
+
+| Class | Count | What it needs |
+|---|---|---|
+| Offline | **1,062** | Nothing but Python; no browser process |
+| Browser-dependent | **9** | A real Chromium process |
+
+**None of these are live external-website tests.** The 9 browser-dependent tests
+in `tests/test_occlusion_live.py` launch a real Chromium against a **local
+`file:///` fixture** (`fixtures/occlusion/index.html`) to verify occlusion and
+UI-only-transition detection. They use no network, no external site, and no
+credentials. They skip automatically when the browser or fixture is unavailable.
+
+The distinction matters when reading validation claims: this suite is entirely
+local-fixture evidence. Behaviour against a real, live website is **not** covered
+by it, and no claim about live sites should be inferred from a passing run.
 
 ---
 

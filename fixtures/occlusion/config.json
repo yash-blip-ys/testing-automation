@@ -1,0 +1,26 @@
+{
+  "site_name": "Occlusion Drawer",
+  "portal_url": "index.html",
+  "_comment": "portal_url is resolved relative to this config file's directory.",
+  "ai_context": "Buy the Backpack and reach the confirmation page.",
+  "test_goal": {
+    "objective": "Buy the Backpack and reach the order confirmation page.",
+    "max_steps": 12,
+    "steps": [
+      {
+        "describe": "Open the purchase flow for the Backpack.",
+        "evidence": {"url_contains": ["receipt"]}
+      },
+      {
+        "describe": "Confirm the order.",
+        "evidence": {"text_contains": ["Order confirmed"]}
+      }
+    ],
+    "evidence": {
+      "text_contains": ["Order confirmed"],
+      "url_contains": ["receipt"],
+      "steps_min": 2
+    }
+  },
+  "target_elements_query": "button, a"
+}
