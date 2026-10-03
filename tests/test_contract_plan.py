@@ -311,6 +311,79 @@ class TestProposalDecisionsAreRecorded(unittest.TestCase):
         self.assertEqual(plan.proposal_log, [])
 
 
+class TestRuntimePlanBindingIsUnconditional(unittest.TestCase):
+    """The report block reads `_plan` unconditionally.
+
+    `_plan` used to be assigned only inside the branch that builds a runtime
+    plan, which that branch skips whenever a config supplies explicit
+    `test_goal.steps` — or supplies no `test_goal` at all. Both are ordinary,
+    supported configurations, and both made the run die at report time with
+    `UnboundLocalError: cannot access local variable '_plan'` instead of
+    finishing. Observed against the `occlusion` fixture, whose config uses
+    configured steps.
+
+    These tests pin the binding, not the branch: `_plan` must be initialised
+    before the guarded assignment so that every later read is defined.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = inspect.getsource(ae.run_pathfinder_agent)
+        cls.lines = cls.src.splitlines()
+
+    def _index_of(self, needle):
+        for i, line in enumerate(self.lines):
+            if needle in line:
+                return i
+        self.fail(f"{needle!r} not found in run_pathfinder_agent")
+
+    def test_plan_is_bound_before_the_guarded_assignment(self):
+        """The regression itself: an unconditional `_plan = None` must precede
+        every conditional assignment, so no config shape can leave it unbound."""
+        bound = self._index_of("_plan = None")
+        assigned = self._index_of("_plan = test_goal.ensure_runtime_plan(")
+        self.assertLess(bound, assigned,
+                        "_plan must be initialised before the branch that "
+                        "assigns it, or configs without a runtime plan read an "
+                        "unbound local")
+
+    def test_initialisation_precedes_every_read(self):
+        """No read of `_plan` may appear before that initialisation.
+
+        Matched on a word boundary: `_plan_proposed` is a different variable and
+        must not be mistaken for a read of `_plan`.
+        """
+        import re
+        bound = self._index_of("_plan = None")
+        pattern = re.compile(r"\b_plan\b")
+        for i, line in enumerate(self.lines):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue  # prose about _plan is not a read of it
+            if not pattern.search(stripped):
+                continue
+            if re.match(r"_plan\s*=\s*None", stripped):
+                continue
+            self.assertGreaterEqual(
+                i, bound,
+                f"`{stripped}` reads _plan before it is bound")
+
+    def test_configured_steps_path_still_binds(self):
+        """A config whose test_goal uses configured steps takes the branch that
+        skips plan construction. That shape must remain bound regardless, which
+        is what this test fails without the initialisation above."""
+        bound = self._index_of("_plan = None")
+        skip = self._index_of("and not test_goal.uses_configured_steps()")
+        self.assertLess(bound, skip,
+                        "the configured-steps skip must not be able to leave "
+                        "_plan unbound")
+
+    def test_report_read_is_guarded_by_a_defined_value(self):
+        """The exact read that raised. It stays unguarded on purpose (it is the
+        report path), so its safety comes from the initialisation instead."""
+        self.assertIn("_plan.verification_provenance(", self.src)
+
+
 class TestReplanningStaysDisabled(unittest.TestCase):
     """Production must not replan. This is a live-tested decision, not a stub."""
 

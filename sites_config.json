@@ -1,20 +1,60 @@
 {
-  "site_name": "SauceLabs E-Commerce Practice Sandbox",
+  "site_name": "Sauce Demo",
   "portal_url": "https://www.saucedemo.com/",
-  "ai_context": "Select two products, add them to the shopping cart, navigate to the checkout page, fill out the required shipping details, and successfully complete the order confirmation.",
+  "ai_context": "Log in, add two items to the cart, then complete checkout and verify the order confirmation page is displayed.",
+  "auth": {
+    "username_selector": "input[data-test='username']",
+    "password_selector": "input[data-test='password']",
+    "selectors": ["button[type='submit']"]
+  },
   "credentials": {
     "username": "standard_user",
     "password": "secret_sauce"
   },
+  "semantic_signals": {
+    "cart_count_selector": ".shopping_cart_badge",
+    "form_values_selector": "input[type='text'], input[type='number'], textarea, input:not([type])"
+  },
+  "test_goal": {
+    "objective": "Log in, add two items to the cart, and complete checkout, verifying the order confirmation is displayed.",
+    "max_steps": 30,
+    "steps": [
+      {
+        "describe": "Open the shopping cart so the cart contents page is displayed.",
+        "evidence": {"url_contains": ["cart"]}
+      },
+      {
+        "describe": "Start checkout from the cart.",
+        "evidence": {"url_contains": ["checkout-step-one"]}
+      },
+      {
+        "describe": "Submit the checkout information form to reach the order overview.",
+        "evidence": {"url_contains": ["checkout-step-two"]}
+      },
+      {
+        "describe": "Finish the order to place it.",
+        "evidence": {"url_contains": ["checkout-complete"]}
+      },
+      {
+        "describe": "Confirm the order confirmation page is displayed.",
+        "evidence": {"text_contains": ["Thank you for your order"]}
+      }
+    ],
+    "evidence": {
+      "text_contains": ["Thank you for your order"],
+      "url_contains": ["checkout-complete"],
+      "text_not_contains": ["locked out", "Epic sadface"],
+      "steps_min": 3
+    }
+  },
   "victory_conditions": {
-    "text_matches": ["thank you for your order", "checkout: complete", "order complete"],
+    "text_matches": ["Thank you for your order"],
     "url_substrings": ["checkout-complete"]
   },
   "form_autofill": [
-    { "keywords": ["first", "name"], "value": "Yuvraj" },
-    { "keywords": ["last"], "value": "Singh" },
-    { "keywords": ["zip", "postal", "code"], "value": "462026" }
+    {"keywords": ["first name"], "value": "Ada"},
+    {"keywords": ["last name"], "value": "Lovelace"},
+    {"keywords": ["zip"], "value": "90210"}
   ],
-  "target_elements_query": "button, a, .shopping_cart_link, [role='button'], input[type='submit']"
+  "target_elements_query": "button, a, [role='button'], [role='link'], input[type='submit'], [onclick]"
 }
-  

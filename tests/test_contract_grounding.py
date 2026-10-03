@@ -418,6 +418,141 @@ class TestLiveGrounding(unittest.IsolatedAsyncioTestCase):
                          ae.GROUND_TARGET_DISABLED)
 
 
+class TestSelectValueResolution(unittest.TestCase):
+    """A select whose value the model did not supply.
+
+    The gate refusing an input action with no value is correct — the agent must
+    not invent what the user wanted. But a user who wrote "select the Editor
+    role" HAS supplied the value, and asking again is a defect. The defect was
+    two-layered: a select's available options were never extracted at all, so no
+    value could be known; and nothing consulted the user's own words.
+
+    These are offline tests. Neither `goal_texts_from_config` nor
+    `resolve_goal_stated_option` existed before this repair, so every test here
+    fails against the original behaviour.
+    """
+
+    CONFIG = {
+        "ai_context": ("Open the confirm dialog and dismiss it, then select "
+                       "the Editor role."),
+        "test_goal": {
+            "objective": "Report the selected role on the page",
+            "final_evidence": ["Editor"],
+        },
+    }
+
+    # --- the defect: options were never observable -----------------------
+    def test_extraction_collects_select_options(self):
+        """A select's choice set must reach the observation.
+
+        Without this the model is asked for a value it cannot know, which is
+        what produced `missing_required_input` on a goal that named the value.
+        """
+        self.assertIn("options: tag === 'select'", ae.DOM_EXTRACT_JS,
+                      "element records must carry a select's options")
+        self.assertIn("el.options || []", ae.DOM_EXTRACT_JS,
+                      "options must be read from the control's real option list")
+
+    # --- goal text collection --------------------------------------------
+    def test_goal_texts_include_every_user_authored_string(self):
+        texts = ae.goal_texts_from_config(self.CONFIG)
+        self.assertIn("select the Editor role", texts[0],
+                      "ai_context is user-authored goal text")
+        self.assertIn("Report the selected role on the page", texts)
+        self.assertIn("Editor", texts,
+                      "final_evidence is user-authored goal text")
+
+    def test_goal_texts_tolerate_absent_or_malformed_config(self):
+        self.assertEqual(ae.goal_texts_from_config(None), [])
+        self.assertEqual(ae.goal_texts_from_config({}), [])
+        self.assertEqual(ae.goal_texts_from_config({"test_goal": "junk"}), [])
+
+    # --- the resolution rule ----------------------------------------------
+    def test_resolves_the_single_option_the_goal_names(self):
+        texts = ae.goal_texts_from_config(self.CONFIG)
+        self.assertEqual(
+            ae.resolve_goal_stated_option(
+                ["Administrator", "Viewer", "Editor"], texts),
+            "Editor")
+
+    def test_refuses_when_no_option_is_named(self):
+        texts = ae.goal_texts_from_config(self.CONFIG)
+        self.assertIsNone(
+            ae.resolve_goal_stated_option(["Administrator", "Viewer"], texts),
+            "an unnamed option must never be invented")
+
+    def test_refuses_when_the_goal_names_two_options(self):
+        """Ambiguity must fall back to asking, not to picking one."""
+        self.assertIsNone(ae.resolve_goal_stated_option(
+            ["Administrator", "Viewer", "Editor"],
+            ["select the Editor or Viewer role"]))
+
+    def test_refuses_without_any_goal_text(self):
+        self.assertIsNone(
+            ae.resolve_goal_stated_option(["Editor"], []))
+
+    def test_refuses_when_the_control_has_no_options(self):
+        self.assertIsNone(ae.resolve_goal_stated_option([], ["Editor"]))
+        self.assertIsNone(ae.resolve_goal_stated_option(None, ["Editor"]))
+
+    def test_matching_is_whole_word_not_substring(self):
+        """A short option must not match inside a longer word.
+
+        'Editor' must not be satisfied by 'Editorial', and a choice too short
+        to be identifiable from running text must not be resolved at all.
+        """
+        self.assertIsNone(ae.resolve_goal_stated_option(
+            ["Editor"], ["open the Editorial page"]))
+        self.assertIsNone(ae.resolve_goal_stated_option(
+            ["In", "Out of stock"], ["show what is In stock"]),
+            "a two-character option is not identifiable from prose; the run "
+            "must ask rather than guess")
+
+    def test_matching_ignores_case_and_surrounding_punctuation(self):
+        self.assertEqual(
+            ae.resolve_goal_stated_option(["Administrator", "Editor"],
+                                         ["then select the editor role."]),
+            "Editor")
+
+    # --- generalization: different layout, wording and option set ----------
+    def test_generalises_to_a_different_control_and_wording(self):
+        """Same capability, unrelated site: a shipping-speed select whose goal
+        is written only in `test_goal.evidence`, with different option labels
+        and none of the original words."""
+        config = {
+            "test_goal": {
+                "objective": "Choose a delivery speed for the order",
+                "evidence": {"text_contains": ["Express"],
+                             "steps_min": 1},
+            },
+        }
+        texts = ae.goal_texts_from_config(config)
+        self.assertEqual(
+            ae.resolve_goal_stated_option(
+                ["Standard", "Express", "Overnight"], texts),
+            "Express")
+
+    def test_generalises_when_only_objective_states_the_choice(self):
+        config = {"test_goal": {"objective": "Set the priority to Urgent"}}
+        self.assertEqual(
+            ae.resolve_goal_stated_option(["Low", "Normal", "Urgent"],
+                                         ae.goal_texts_from_config(config)),
+            "Urgent")
+
+    def test_duplicate_option_texts_do_not_create_false_ambiguity(self):
+        """The same option listed twice is one choice, not two."""
+        self.assertEqual(
+            ae.resolve_goal_stated_option(["Editor", "editor", "EDITOR"],
+                                         ["select the Editor role"]),
+            "Editor")
+
+    def test_blank_options_are_ignored(self):
+        self.assertEqual(
+            ae.resolve_goal_stated_option(["", "  ", "Editor"],
+                                         ["select the Editor role"]),
+            "Editor")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

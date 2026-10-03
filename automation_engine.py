@@ -1580,6 +1580,13 @@ DOM_EXTRACT_JS = """(args) => {
             sensitive: sensitive,
             occluded_by: blocker ? (accNameOfForeign(blocker) || 'unnamed-overlay') : '',
             value: safeValue(el, tag, typeAttr, sensitive),
+            options: tag === 'select'
+                ? Array.from(el.options || [])
+                    .slice(0, Math.min(maxElements, 50))
+                    .map(function (o) {
+                        return (o.textContent || '').trim().slice(0, maxName);
+                    })
+                : undefined,
             placeholder: (el.getAttribute('placeholder') || '').slice(0, maxName),
             aria_label: (el.getAttribute('aria-label') || '').slice(0, maxName),
             testid: (el.getAttribute('data-testid') || el.getAttribute('data-test') || '')
@@ -2146,6 +2153,269 @@ GROUND_AWAITING_CONFIRMATION = "awaiting_user_confirmation"
 GROUND_POLICY_BLOCKED = "policy_blocked"
 
 
+def goal_texts_from_config(config, active_goal=None):
+    """Every string in a run config that the USER authored about the task.
+
+    The objective is not the only place a goal is written. A run config states
+    the goal in `ai_context`, in `test_goal.objective`, in
+    `test_goal.final_evidence`, and in the user's own evidence clauses. All of
+    it is user intent, so all of it is legitimate input to value resolution.
+
+    `active_goal` is optional and exists for one reason: a run may be given a
+    new objective mid-flight. When one is supplied and carries an objective, the
+    config's `ai_context` and `test_goal.objective` are NOT included, because
+    those are the snapshot taken at load time and the user has since withdrawn
+    them. Resolving a form value against a withdrawn objective is the same defect
+    as executing an action planned under one, so supersession has to reach value
+    resolution too. The verification clauses (`final_evidence`, `evidence`) still
+    come from the config: they define what counts as done, which a goal update
+    does not redefine. Omitting `active_goal` reproduces the original behaviour
+    exactly.
+
+    Returns a list of non-empty strings. Pure; no model, no I/O.
+    """
+    if not isinstance(config, dict):
+        return []
+    out = []
+
+    def add(value):
+        if isinstance(value, str) and value.strip():
+            out.append(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                add(item)
+
+    live_objective = getattr(active_goal, "objective", "") if \
+        active_goal is not None else ""
+    if not live_objective:
+        add(config.get("ai_context"))
+    else:
+        add(getattr(active_goal, "statement", lambda: live_objective)())
+        add(getattr(active_goal, "constraints", None))
+    test_goal = config.get("test_goal")
+    if isinstance(test_goal, dict):
+        if not live_objective:
+            add(test_goal.get("objective"))
+        add(test_goal.get("final_evidence"))
+        add(test_goal.get("evidence"))
+    return out
+
+
+MIN_RESOLVABLE_OPTION_CHARS = 3
+
+
+def _mentions_option(text, option):
+    """True when `text` names `option` as a whole word, not as a substring.
+
+    Whole-word matching is what keeps "in" from matching "In stock", and
+    "Editor" from matching "Editorial". Case is ignored because a user naming
+    a choice in prose will not always match the control's capitalisation.
+    """
+    if not option:
+        return False
+    pattern = r"(?<!\w)" + re.escape(option) + r"(?!\w)"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _named_option_for_control(options, goal_texts):
+    """The single option of ONE control that the user's own words name.
+
+    Returns the option text, or None. Refuses on zero matches (nothing was
+    named) and on more than one (the words do not identify a unique choice), so
+    a control can never be credited with a value the goal did not settle.
+    """
+    if not options:
+        return None
+    seen = {}
+    for option in options:
+        if not isinstance(option, str):
+            continue
+        text = option.strip()
+        if text and len(text) >= MIN_RESOLVABLE_OPTION_CHARS:
+            seen.setdefault(text.lower(), text)
+    if not seen:
+        return None
+    matched = []
+    for option in seen.values():
+        for text in goal_texts or ():
+            if _mentions_option(text, option):
+                matched.append(option)
+                break
+    if len(matched) != 1:
+        return None
+    return matched[0]
+
+
+def goal_candidate_evidence(goal_texts, candidates, focus_text=""):
+    """Which observed controls the current goal actually points at, and why.
+
+    This is the piece the navigator could not previously do for itself. It was
+    shown a list of bare labels — "Username", "Password", "Role", "Team",
+    "Save changes" — with no indication of what any of them is or which one the
+    goal referred to. A control being present, enabled and clickable says
+    nothing about it being the control the user meant, so the model had to infer
+    relevance from label text alone. On a small model that inference is close to
+    arbitrary, and the run then acts on a plausible-looking but irrelevant
+    control.
+
+    Every reason reported here is a FACT about two strings that are both
+    already in hand — the user's own words, and the control's own metadata:
+
+      * the goal names this control's accessible name;
+      * this control is the one that OFFERS a choice the goal names, which is
+        what actually distinguishes a `<select>` from a text field sitting
+        beside it when the user wrote "select the Editor role";
+      * the sub-task currently being advanced names this control.
+
+    No scoring, no threshold, no ranking-by-confidence. A control with no such
+    fact connecting it is simply absent from the result, and a caller may say so
+    to the model rather than implying every visible control is a candidate.
+
+    `candidates` is an iterable of (option, record) pairs — the same
+    option-keyed mapping the rest of the contract uses, so a label that several
+    controls share is reported once per occurrence and stays individually
+    addressable.
+
+    Returns a list of {"option", "role", "value", "implies", "reasons"} for
+    the options that have at least one reason, in the order the options were
+    observed. `implies` states what acting on that control would DO, so a value
+    the goal names is never mistaken for a control to click.
+    Pure and deterministic: no model call, no site knowledge, no I/O.
+    """
+    out = []
+    for option, record in candidates or ():
+        if not isinstance(record, dict):
+            continue
+        name = (record.get("name") or "").strip()
+        if not name:
+            continue
+        reasons = []
+        named_by_goal = None
+        for text in goal_texts or ():
+            if _mentions_option(text, name):
+                named_by_goal = text
+                break
+        if named_by_goal is not None:
+            reasons.append(
+                "your goal refers to this control by name "
+                f"({name!r})")
+        if focus_text and _mentions_option(focus_text, name):
+            reasons.append(
+                f"the sub-task being advanced now refers to it ({name!r})")
+        stated = _named_option_for_control(record.get("options"), goal_texts)
+        if stated is not None:
+            reasons.append(
+                f"it is the only control on the page offering the choice "
+                f"{stated!r}, which your goal names")
+            implies = (f"SET ITS VALUE to {stated!r}")
+        elif operation_for_record(record) in _INPUT_OPERATIONS:
+            implies = ("ENTER A VALUE into it "
+                       "(the value must come from the goal text)")
+        elif record.get("role") == "link":
+            implies = "FOLLOW it to reach the page the goal describes"
+        else:
+            implies = "PRESS it"
+        if reasons:
+            out.append({
+                "option": option,
+                "role": record.get("role") or "",
+                "value": record.get("value") or "",
+                "implies": implies,
+                "reasons": reasons,
+            })
+    return out
+
+
+# Operations whose entire purpose is to change a control's own value. For these,
+# the control's value IS the observable effect, and the page's structure
+# legitimately does not move: a `<select>` that goes from "-- choose --" to
+# "Editor" has changed the world while the URL, the labels and the node hash all
+# stay exactly as they were.
+VALUE_MUTATING_OPERATIONS = (OP_FILL, OP_SELECT, OP_TOGGLE)
+
+
+def control_value_transition(operation, before_value, after_value):
+    """Did a value-changing action demonstrably change what it aimed at?
+
+    Returns True (the value moved), False (the action was aimed correctly and
+    nothing moved), or None (not knowable from what was observed).
+
+    The distinction the run loop needs is "this changed nothing" versus "this
+    changed something the node hash cannot see". Node identity is derived from
+    the URL and the controls' accessible NAMES, which are stable across a value
+    edit, so a fill, a select or a toggle that succeeded is indistinguishable
+    from one that did nothing if the only instrument is the node hash. That
+    misreading is not cosmetic: it is what made the engine discard a correct
+    selection and then wander off to an unrelated control.
+
+    `None` is a first-class answer, not a failure. A control that has vanished
+    (a navigation), or a value that was never observable (a sensitive field),
+    says nothing about whether the action worked, and the caller must fall back
+    to its ordinary evidence rather than guess.
+
+    Pure and deterministic: no model call, no site knowledge, no I/O.
+    """
+    if operation not in VALUE_MUTATING_OPERATIONS:
+        return None
+    if before_value is None or after_value is None:
+        return None
+    return before_value != after_value
+
+
+def resolve_goal_stated_option(options, goal_texts):
+    """Pick the one option the user's own goal names, or None.
+
+    An input action with no value is refused by the grounding gate, and that
+    refusal is correct: the agent must not invent what the user wanted. But a
+    user who wrote "select the Editor role" HAS supplied the value, and asking
+    them again is a defect, not caution.
+
+    This resolves a value only under three independent conditions:
+
+      1. it is an option that actually exists on the control,
+      2. it is specific enough to be identified from prose at all, and
+      3. the user named it in their own run config.
+
+    All three are facts, not inferences, so nothing here can be hallucinated.
+    If zero or more than one option qualifies, the answer is None and the run
+    asks the user, which is the existing and correct behaviour.
+
+    Condition 2 exists because a very short option is not reliably
+    identifiable in running text: "In" appears inside "show what is In stock"
+    as a whole word without the user ever having chosen it. A choice too short
+    to be unambiguous is one the agent must ask about.
+
+    Pure and deterministic: no model call, no site knowledge, no I/O.
+    """
+    if not options:
+        return None
+    seen = {}
+    for option in options:
+        if not isinstance(option, str):
+            continue
+        text = option.strip()
+        if not text:
+            continue
+        seen.setdefault(text.lower(), text)
+    seen = {k: v for k, v in seen.items()
+            if len(v) >= MIN_RESOLVABLE_OPTION_CHARS}
+    if not seen:
+        return None
+
+    matched = []
+    for option in seen.values():
+        for text in goal_texts or ():
+            if _mentions_option(text, option):
+                matched.append(option)
+                break
+    if len(matched) != 1:
+        return None
+    return matched[0]
+
+
 def validate_action_grounding(intent, observation, *, policy=None,
                                allow_ambiguous=False):
     """Decide whether an intent may be handed to the browser.
@@ -2580,6 +2850,363 @@ GOAL_FAIL = "FAIL"
 GOAL_BLOCKED = "BLOCKED"
 
 
+# ---------------------------------------------------------------------------
+# External goal updates.
+#
+# The objective a run starts with is fixed at construction. That is correct for
+# a single-goal run and wrong for a conversation: a user who changes their mind
+# mid-run needs the agent to notice, drop the superseded work, and keep going
+# toward the new objective WITHOUT restarting.
+#
+# An `ActiveGoal` is the single source of truth for the objective once a run
+# starts. It is versioned, because "which goal was this decision made under?"
+# must be answerable at the moment an action is dispatched, not just when it
+# was planned. `TestGoal.objective` reads through to it, so the planner, the
+# navigator, the runtime plan and evidence evaluation all follow an update
+# without any of them being aware that updates exist.
+#
+# An update is only ever read from an explicitly external channel. Page content
+# cannot reach it, so a website cannot instruct the agent to change the user's
+# goal or to widen its own authorization.
+# ---------------------------------------------------------------------------
+
+# Goal-update lifecycle states.
+GOAL_UPDATE_RECEIVED = "received"
+GOAL_UPDATE_ACCEPTED = "accepted"
+GOAL_UPDATE_APPLIED = "applied"
+GOAL_UPDATE_WAITING_FOR_SAFE_BOUNDARY = "waiting_for_safe_boundary"
+GOAL_UPDATE_REJECTED = "rejected"
+GOAL_UPDATE_NEEDS_CLARIFICATION = "needs_clarification"
+
+# What an update does to the previous objective. The submitter states this
+# explicitly. It is never inferred, because reading a replacement as a
+# refinement (or the reverse) silently changes what the agent is authorised to
+# do, and that is not a decision this layer may make on the user's behalf.
+GOAL_KIND_REPLACEMENT = "replacement"
+GOAL_KIND_REFINEMENT = "refinement"
+GOAL_KIND_CLARIFICATION = "clarification"
+
+_GOAL_KINDS = (GOAL_KIND_REPLACEMENT, GOAL_KIND_REFINEMENT,
+               GOAL_KIND_CLARIFICATION)
+
+
+class GoalUpdate:
+    """One instruction received from the user while a run is in progress.
+
+    `instruction` is the user's own words and is preserved verbatim: it is
+    never rewritten, summarised into a "better" goal, or discarded. Whatever
+    happens next, the record of what was asked for survives.
+    """
+
+    def __init__(self, instruction, kind=None, constraints=None,
+                 client_seq=None):
+        self.instruction = (instruction or "").strip()
+        self.kind = (kind or "").strip().lower() or None
+        self.constraints = [c for c in (constraints or []) if c]
+        # Monotonic counter from the submitting client. Ordering between updates
+        # is decided by the order they were accepted, never by this value, but
+        # it lets a caller detect its own update was dropped.
+        self.client_seq = client_seq
+
+    @classmethod
+    def from_payload(cls, payload):
+        if not isinstance(payload, dict):
+            return cls(str(payload or ""))
+        return cls(payload.get("instruction") or payload.get("objective"),
+                   kind=payload.get("kind"),
+                   constraints=payload.get("constraints"),
+                   client_seq=payload.get("client_seq"))
+
+    def describe(self):
+        return (f"{self.kind or 'unclassified'}: {self.instruction!r}"
+                + (f" +{self.constraints!r}" if self.constraints else ""))
+
+
+class ActiveGoal:
+    """The objective currently governing planning and execution, plus history.
+
+    Version 1 is the objective the run was configured with. Every accepted
+    update advances it. `superseded` keeps the objectives that were replaced so
+    a plan, a report or a human reader can still see what the agent used to be
+    doing, and why.
+    """
+
+    def __init__(self, objective="", constraints=None):
+        self.version = 1
+        self.objective = (objective or "").strip()
+        self.constraints = [c for c in (constraints or []) if c]
+        self.superseded = []
+        self.updates = []
+        self.pending_clarification = None
+        self.applied_version = 1
+
+    # -- history -----------------------------------------------------------
+    def record(self, update, status, detail=""):
+        entry = {
+            "version": self.version,
+            # Every applied update advances the version first, so the version
+            # this instruction was received under is the one before it. Storing
+            # it here (rather than only in the channel's echo) means the retained
+            # history is self-describing wherever it is read from.
+            "previous_version": max(self.version - 1, 1),
+            "client_seq": update.client_seq,
+            "kind": update.kind,
+            "instruction": update.instruction,
+            "constraints": list(update.constraints),
+            "status": status,
+            "detail": detail,
+        }
+        self.updates.append(entry)
+        return entry
+
+    def history(self):
+        """Auditable record of every instruction received, in order."""
+        return list(self.updates)
+
+    # -- application -------------------------------------------------------
+    def apply(self, update):
+        """Apply one update. Returns (status, detail).
+
+        An update is only applied when it can be classified without guessing.
+        An empty instruction, or one whose relationship to the current objective
+        is unstated, is preserved and reported as needing clarification rather
+        than being interpreted.
+        """
+        if not update.instruction:
+            self.record(update, GOAL_UPDATE_REJECTED, "empty instruction")
+            return GOAL_UPDATE_REJECTED, "empty instruction"
+
+        if update.kind not in _GOAL_KINDS:
+            detail = (f"kind {update.kind!r} is not one of "
+                      f"{list(_GOAL_KINDS)}; not interpreting it")
+            self.record(update, GOAL_UPDATE_NEEDS_CLARIFICATION, detail)
+            self.pending_clarification = update.instruction
+            return GOAL_UPDATE_NEEDS_CLARIFICATION, detail
+
+        if update.kind == GOAL_KIND_CLARIFICATION:
+            # A clarification supplies missing information. It never replaces
+            # the objective, so the version advances to keep every subsequent
+            # decision traceable to a distinct instruction.
+            detail = ("clarification recorded; it does not replace the "
+                      "objective")
+            self.pending_clarification = None
+            self.version += 1
+            self.record(update, GOAL_UPDATE_APPLIED, detail)
+            self.applied_version = self.version
+            return GOAL_UPDATE_APPLIED, detail
+
+        if update.kind == GOAL_KIND_REPLACEMENT:
+            # A replacement supersedes the whole objective. Anything verified
+            # under the old objective was verified against requirements the user
+            # has now withdrawn, so it cannot be carried forward.
+            detail = "replaced the previous objective"
+            self.superseded.append({
+                "version": self.version,
+                "objective": self.objective,
+                "constraints": list(self.constraints),
+            })
+            self.objective = update.instruction
+            self.constraints = list(update.constraints)
+            self.pending_clarification = None
+            self.version += 1
+            self.record(update, GOAL_UPDATE_APPLIED, detail)
+            self.applied_version = self.version
+            return GOAL_UPDATE_APPLIED, detail
+
+        # Refinement: the objective stands, constraints accumulate. Work
+        # already verified against it stays valid, which is the whole point of
+        # not treating this as a replacement.
+        detail = "added constraint(s); original objective retained"
+        for constraint in update.constraints or [update.instruction]:
+            if constraint not in self.constraints:
+                self.constraints.append(constraint)
+        self.pending_clarification = None
+        self.version += 1
+        self.record(update, GOAL_UPDATE_APPLIED, detail)
+        self.applied_version = self.version
+        return GOAL_UPDATE_APPLIED, detail
+
+    def statement(self):
+        """The objective plus retained constraints, for a model prompt."""
+        if not self.constraints:
+            return self.objective
+        return (f"{self.objective}\nAdditional constraints from the user: "
+                + "; ".join(self.constraints))
+
+    def report_block(self, discarded_actions=0):
+        """Markdown recording what the user asked for and what was applied.
+
+        Retention is only real if a reader can still see it. A goal that was
+        replaced, an instruction that was accepted, and an instruction that was
+        preserved-but-needs-clarification are all things the run was told and
+        deliberately did not act on, so all of them are stated rather than
+        summarised away. Returns "" when no update was ever received, so an
+        unchanged run's report stays exactly as it was.
+        """
+        if not self.updates:
+            return ""
+        lines = [
+            f"Active goal after **{len(self.updates)}** update request(s): "
+            f"**v{self.version}**",
+            "",
+            f"- Current objective: {self.objective!r}",
+        ]
+        if self.constraints:
+            lines.append("- Retained constraints: "
+                         + "; ".join(repr(c) for c in self.constraints))
+        if self.superseded:
+            lines += ["", "### Superseded objectives", ""]
+            for entry in self.superseded:
+                lines.append(
+                    f"- v{entry.get('version')}: {entry.get('objective')!r}"
+                    + (f" (constraints: {entry.get('constraints')!r})"
+                       if entry.get("constraints") else ""))
+        lines += ["", "### Instructions received", ""]
+        for entry in self.updates:
+            lines.append(
+                f"- v{entry.get('previous_version', entry.get('version'))}"
+                f" -> v{entry.get('version')} "
+                f"[{entry.get('kind') or 'unclassified'}] "
+                f"{entry.get('instruction')!r} — **{entry.get('status')}**: "
+                f"{entry.get('detail')}"
+                + (f" (client_seq={entry.get('client_seq')})"
+                   if entry.get("client_seq") is not None else ""))
+        if self.pending_clarification:
+            lines += ["", "### Held pending clarification", "",
+                      f"- {self.pending_clarification!r} — preserved verbatim, "
+                      "not applied. The run continued on the previous "
+                      "objective rather than guessing what was meant."]
+        if discarded_actions:
+            lines += ["", f"**{discarded_actions}** planned action(s) were "
+                          "discarded because the goal changed after they were "
+                          "chosen and before they were dispatched."]
+        return "\n".join(lines)
+
+
+class GoalUpdateChannel:
+    """An external, out-of-band path for goal updates.
+
+    Backed either by an in-memory list (used by tests and by embedders that
+    drive the agent in-process) or by a JSON-lines file, which lets a separate
+    process change the goal of a run that is already executing.
+
+    Only complete lines are consumed. A half-written line is left for the next
+    poll instead of being parsed into a truncated instruction, so a partially
+    flushed update can never become an active goal.
+    """
+
+    def __init__(self, path=None, memory=None):
+        self.path = path
+        self._memory = list(memory or [])
+        self._offset = 0
+        self._pending = ""
+
+    # -- submitting --------------------------------------------------------
+    def submit(self, instruction, kind=None, constraints=None):
+        update = GoalUpdate(instruction, kind=kind, constraints=constraints)
+        self._memory.append(update)
+        return update
+
+    def submit_payload(self, payload):
+        update = GoalUpdate.from_payload(payload)
+        self._memory.append(update)
+        return update
+
+    # -- consuming ---------------------------------------------------------
+    def drain(self):
+        """Return updates not yet consumed. Never raises on bad input."""
+        out = list(self._memory)
+        self._memory = []
+        if not self.path or not os.path.exists(self.path):
+            return out
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read()
+                self._offset = handle.tell()
+        except OSError:
+            return out
+        if not chunk:
+            return out
+        lines = (self._pending + chunk).split("\n")
+        # The final element is either an unterminated partial line or empty.
+        self._pending = lines.pop() if not chunk.endswith("\n") else ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(GoalUpdate.from_payload(json.loads(line)))
+            except (ValueError, TypeError):
+                # Unreadable input is dropped rather than guessed at. The
+                # channel has no way to ask the user, so the run keeps its
+                # current objective, which is the safe direction.
+                continue
+        return out
+
+    def drain_into(self, active_goal, test_goal=None):
+        """Consume pending updates and apply them to the active goal.
+
+        Each accepted update is acknowledged with the version it produced, so a
+        reader can tell an acknowledgement apart from a completion: an
+        acknowledgement says the agent is now working toward version N, and says
+        nothing about whether N has been achieved.
+
+        Returns one record per consumed update.
+        """
+        records = []
+        for update in self.drain():
+            previous = active_goal.version
+            status, detail = active_goal.apply(update)
+            entry = {
+                "version": active_goal.version,
+                "previous_version": previous,
+                "kind": update.kind,
+                "instruction": update.instruction,
+                "status": status,
+                "detail": detail,
+                "client_seq": update.client_seq,
+            }
+            if status == GOAL_UPDATE_APPLIED:
+                if update.kind == GOAL_KIND_REPLACEMENT and test_goal is not None:
+                    test_goal.invalidate_runtime_plan(
+                        "the objective was replaced by a new user goal")
+                print(f"[Goal] Acknowledged user goal update "
+                      f"{previous} -> {active_goal.version}: {update.describe()}"
+                      f" [{status}] {detail}. Now pursuing version "
+                      f"{active_goal.version}: {active_goal.objective!r}")
+            else:
+                print(f"[Goal] User goal update NOT applied: "
+                      f"{update.describe()} [{status}] {detail}. Still on "
+                      f"version {active_goal.version}. The instruction is kept "
+                      "and needs clarification before it can be applied.")
+            records.append(entry)
+        return records
+
+
+def invalidate_goal_scoped_step_state(scored_nodes, node_goal_context):
+    """Drop per-node scoring state produced under a goal that no longer holds.
+
+    `scored_nodes` records "this node has already been ranked" and
+    `node_goal_context` records which sub-goals were outstanding when it was.
+    Both are answers to "what should be done from here", asked under a specific
+    objective. When the objective is replaced, a ranking produced for the
+    withdrawn goal is not a weaker answer to the new question — it is an answer
+    to a different question, and reusing it is how an agent keeps executing a
+    plan the user took away.
+
+    Clearing is therefore unconditional on any version change. Clearing it at
+    both safe boundaries is cheap (the next step re-asks the model) and is the
+    only option that cannot depend on noticing that the new objective happens to
+    decompose into the same number of sub-goals as the old one.
+
+    Returns True so call sites can report the disposal without re-deriving it.
+    """
+    scored_nodes.clear()
+    node_goal_context.clear()
+    return True
+
+
 class TestGoal:
     """Lightweight, site-agnostic goal + observable-evidence model.
 
@@ -2605,7 +3232,7 @@ class TestGoal:
     never disagree.
     """
 
-    def __init__(self, goal_dict):
+    def __init__(self, goal_dict, active_goal=None):
         if not isinstance(goal_dict, dict):
             goal_dict = {}
         # The objective is the authoritative statement of what the user asked
@@ -2613,6 +3240,12 @@ class TestGoal:
         # a runtime plan nor any later code can redefine it mid-run; only
         # constructing a new TestGoal from new user input can change it.
         self._objective = (goal_dict.get("objective") or "").strip()
+        # When a run supplies an ActiveGoal, this object stops being the owner
+        # of the objective and reads through to it. Every existing consumer —
+        # the planner, the navigator, the runtime plan, evidence evaluation —
+        # then follows an accepted goal update without being aware that
+        # updates exist, and none of them can hold a stale copy.
+        self.active_goal = active_goal
         self.evidence = goal_dict.get("evidence") or {}
 # A malformed budget must not abort the run with a bare traceback, and
         # must not silently become a number the user did not ask for. The
@@ -2632,6 +3265,10 @@ class TestGoal:
         # page does not make completed work look outstanding again. Only evidence
         # can latch, never an attempt.
         self._verified_steps = set()
+        # Steps that were configured for an objective the user has since
+        # replaced. They are retained, never deleted, so a report can still show
+        # what the run was originally told to do — but they no longer steer.
+        self.superseded_steps = []
         if isinstance(raw_steps, list):
             for entry in raw_steps:
                 if isinstance(entry, dict) and (entry.get("describe") or entry.get("evidence")):
@@ -2663,7 +3300,58 @@ class TestGoal:
     # rather than silently changing the target of verification.
     @property
     def objective(self):
+        if self.active_goal is not None:
+            return self.active_goal.objective
         return self._objective
+
+    @property
+    def goal_version(self):
+        """The goal version every current decision was made under."""
+        return self.active_goal.version if self.active_goal is not None else 1
+
+    @property
+    def goal_statement(self):
+        """Objective plus retained constraints, for a model prompt."""
+        if self.active_goal is not None:
+            return self.active_goal.statement()
+        return self._objective
+
+    def invalidate_runtime_plan(self, reason=""):
+        """Discard every plan built under a now-superseded objective.
+
+        Called when an accepted update replaces the objective. Three separate
+        things were derived from requirements the user has withdrawn, and all
+        three have to go, or the agent keeps satisfying a goal it no longer has:
+
+          * the runtime plan's items and its verified set;
+          * the latch on which configured steps have been confirmed;
+          * the configured steps themselves, because they ARE the plan for the
+            old objective. They are moved to `superseded_steps` rather than
+            deleted, so retention is preserved while `uses_configured_steps()`
+            stops reporting them and the runtime plan takes over from the new
+            objective.
+
+        A refinement or clarification does not reach this method: those keep the
+        objective, so work already verified against it stays valid.
+        """
+        plan = getattr(self, "runtime_plan", None)
+        if plan is not None:
+            plan.clear()
+        released_steps = bool(getattr(self, "steps", None))
+        if released_steps:
+            self.superseded_steps.append({
+                "objective": self.objective,
+                "steps": list(self.steps),
+            })
+            self.steps = []
+        if getattr(self, "_verified_steps", None):
+            self._verified_steps.clear()
+        if reason:
+            print(f"[Goal] Runtime plan invalidated: {reason}"
+                  + (f"; {len(self.superseded_steps[-1]['steps'])} configured "
+                     "step(s) superseded and retained for the report"
+                     if released_steps else ""))
+        return plan
 
     def is_configured(self):
         return bool(self.objective)
@@ -2717,6 +3405,14 @@ class TestGoal:
             return None
         if self.runtime_plan is None:
             self.runtime_plan = RuntimePlan(self.objective)
+        elif self.runtime_plan.objective != self.objective:
+            # The plan object survives invalidate_runtime_plan() so a caller
+            # holding a reference does not suddenly find None, but its objective
+            # is still the withdrawn string. Re-point it BEFORE the re-seed
+            # below, because seed_from_objective() splits `self.objective` —
+            # without this, a replacement re-seeds the plan with requirements
+            # derived from the goal the user just took away.
+            self.runtime_plan.objective = self.objective
         # Seed exactly once. Re-seeding on a later page would silently discard
         # verified requirements, so an existing plan is left alone; callers that
         # want a different route call replan() or RuntimePlan.adopt_model_plan.
@@ -4727,6 +5423,69 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
             f"exact strings — nothing else is valid):\n{available_elements}"
         )
 
+    # Deterministic goal-relevance evidence.
+    #
+    # The option list is a set of bare labels. Nothing in it says which control
+    # the USER meant, or even what kind of control each one is, so the model was
+    # left to infer relevance from label text alone — and on a small model that
+    # inference lands on whatever looks most like a next step ("Save changes")
+    # rather than on the control the goal actually names ("Role"). This block
+    # supplies the connection as facts, computed from the goal text and each
+    # control's own metadata, and states the action each control implies.
+    relevance_block = ""
+    if observation is not None and goal:
+        _focus = ""
+        for _row in remaining_work or ():
+            if not _row.get("done"):
+                _focus = (_row.get("describe")
+                          or _row.get("requirement") or "")
+                break
+        _ev_rows = goal_candidate_evidence(
+            [goal], list((observation.discovery.get("by_option") or {}).items()),
+            focus_text=_focus)
+        _lines = [
+            "GOAL RELEVANCE — which controls your goal demonstrably refers to. "
+            "This is computed by the system from your goal text and each "
+            "control's own metadata; it is evidence about the page, not a "
+            "suggestion, and it is not a ranking:"
+        ]
+        _matched = 0
+        for _rec in _ev_rows:
+            _matched += 1
+            _lines.append(
+                f"  - {_rec['option']!r}  (kind: {_rec.get('role') or 'unknown'}"
+                + (f", current value: {_rec.get('value')!r}"
+                   if _rec.get("value") else "")
+                + f") — TO ADVANCE THE GOAL: {_rec.get('implies') or '?'}")
+            for _why in _rec.get("reasons") or ():
+                _lines.append(f"      * {_why}")
+        if not _matched:
+            _lines.append(
+                "  (NONE. No control on this page has a demonstrated "
+                "connection to the wording of your goal. Do not guess: pick the "
+                "control that would let you learn more about the page, or say "
+                "you cannot proceed.)")
+        else:
+            _lines += [
+                "  HOW TO USE THIS:",
+                "  * Prefer a control listed above. A control that appears ONLY "
+                "in the option list below has NO demonstrated connection to your "
+                "goal — being visible, enabled or easy to click is not evidence "
+                "that it is what you were asked to use.",
+                "  * Match the action to the kind of control: a combobox, "
+                "textbox or checkbox needs a value in \"action_inputs\"; a button "
+                "or link needs none.",
+                "  * A value named in a \"TO ADVANCE THE GOAL\" line is a VALUE "
+                "FOR the control on that line, not a control to click. Only "
+                "pick something from the option list below as your "
+                "best_choice.",
+                "  * A control that commits or submits is not the same as a "
+                "control that sets a value. If your goal is to SET something, "
+                "setting it is the step; committing it may be a later, separate "
+                "step.",
+            ]
+        relevance_block = "\n".join(_lines) + "\n"
+
     base_prompt = (
         f"USER GOAL: {goal}\n\n"
         f"RECENT ACTIONS ALREADY TAKEN (do not blindly repeat these; consider the full flow): {recent_actions_text}\n"
@@ -4735,6 +5494,7 @@ def ask_ai_navigator(available_elements, goal, recent_actions,
         f"{occluded_block}"
         f"{context_block}\n"
         f"{options_block}\n\n"
+        f"{relevance_block}"
         f"{disabled_block}"
         f"{unproductive_block}"
         "INSTRUCTIONS:\n"
@@ -4999,7 +5759,7 @@ def generate_scan_report(site_name, target_goal, status, total_steps, nodes_disc
                          requirements=None, verification_provenance=None,
                          transitions=None, run_stats=None,                          errors=None,
                          dropped_clauses=None, ambiguous_requirements=None,
-                         recovery=None, shadow=None):
+                         recovery=None, shadow=None, goal_updates=None):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     report_filename = f"scan_report_{timestamp}.md"
     # The raw status is preserved; the outcome is the meaning. Both are shown,
@@ -5129,6 +5889,19 @@ Shadow mode asked for revised routes and recorded what would have happened
 without adopting any of them. Nothing in this section influenced an action, a
 transition, or the final verification — production replanning remained off for
 the whole run.
+"""
+    if goal_updates:
+        markdown_content += f"""
+## Goal Updates
+{goal_updates}
+
+Updates arrived only from the explicit external goal channel; no page content
+could reach it. A replacement withdrew the previous objective, so the plan, the
+confirmed-sub-goal state and any per-node scoring derived from it were discarded
+before the next action was chosen. A goal update carries no authorization of any
+kind: it cannot grant, widen or revoke a confirmation, and the safety policy and
+the grounding gate were unchanged and were applied to every action taken after
+the switch exactly as before.
 """
     if transitions:
         markdown_content += f"""
@@ -6690,7 +7463,8 @@ def load_config(config_path="sites_config.json", url_override=None,
 
 async def run_pathfinder_agent(config_path="sites_config.json",
     url_override=None, goal_override=None,
-                                max_steps_override=None):
+                                max_steps_override=None,
+                                goal_channel=None):
     check_environment()
 
     # Before anything can call the model. The counters are module-level, so
@@ -6766,6 +7540,33 @@ async def run_pathfinder_agent(config_path="sites_config.json",
     # Optional test-goal block (natural-language objective + observable
     # evidence rules). Absent = legacy victory-condition behavior only.
     test_goal = TestGoal(config.get("test_goal")) if config.get("test_goal") else None
+
+    # Everything the user wrote about this task, read once. A select whose value
+    # the model did not supply is resolved from these strings against the
+    # control's own options, never from anything the model makes up.
+    _goal_texts = goal_texts_from_config(config)
+
+    # Live goal channel. An embedder driving this run in-process passes its own
+    # handle; otherwise a JSON-lines file named in the config lets a separate
+    # process change the goal of an already-running agent. Absent both, the run
+    # behaves exactly as before: one fixed objective, version 1.
+    _goal_channel = goal_channel or GoalUpdateChannel(
+        path=(config.get("goal_updates_file") or None))
+    _active_goal = ActiveGoal(
+        objective=(test_goal.objective if test_goal is not None else ""),
+        constraints=(config.get("goal_constraints") or []))
+    if test_goal is not None:
+        test_goal.active_goal = _active_goal
+    _goal_version_this_step = _active_goal.version
+    _stale_decision = None
+    # How many actions the goal-version guard threw away. Counted rather than
+    # merely logged, because "how often did a user's late update cost the run a
+    # step" is the question a boundary that discards work invites.
+    _goals_discarded_actions = 0
+    print(f"[Goal] Active goal v{_active_goal.version}: "
+          f"{_active_goal.objective!r}"
+          + (f" external channel: {_goal_channel.path}"
+             if getattr(_goal_channel, "path", None) else ""))
 
     async with async_playwright() as p:
         # Browser behaviour is configuration, not a hardcoded constant:
@@ -6993,6 +7794,10 @@ async def run_pathfinder_agent(config_path="sites_config.json",
         # Prior step's observation, for the state-change report. None on the
         # first step, where there is nothing yet to have changed from.
         previous_observation = None
+        # (transition_seq, operation, value_before) for the action currently in
+        # flight. See control_value_transition(): this is what makes a
+        # successful fill/select/toggle distinguishable from a no-op.
+        _pending_value_effect = None
         # Set when the run halts at the safety boundary, so the report can say
         # exactly which action needs a decision rather than only that it ended.
         _confirmation_request = None
@@ -7047,6 +7852,40 @@ async def run_pathfinder_agent(config_path="sites_config.json",
 
         for step in range(max_search_depth):
             await wait_for_page_settled(page)
+
+            # Safe boundary: no action is in flight here, so an external goal
+            # update can be taken before anything is planned under it. Polling
+            # inside an in-flight Playwright call is deliberately NOT done — an
+            # interrupted click cannot be assumed not to have happened, so the
+            # update waits for the boundary and the resulting page state is
+            # observed normally.
+            #
+            # drain_into() is synchronous: it only reads a file tail and applies
+            # bookkeeping, so awaiting it would raise before the first step ever
+            # ran. Polling does not need to be async to be safe.
+            _goal_channel.drain_into(_active_goal, test_goal)
+            if _active_goal.version != _goal_version_this_step:
+                _goal_version_this_step = _active_goal.version
+                _stale_decision = None
+                # The step counter measures "no progress toward the objective".
+                # Carrying it across a replacement would apply the old goal's
+                # stall count to the new one and could trigger a replan of a
+                # route that has simply not been tried yet.
+                _steps_since_progress = 0
+                invalidate_goal_scoped_step_state(_scored_nodes,
+                                                 _node_goal_context)
+                # Value resolution must not run against a withdrawn objective
+                # either. See goal_texts_from_config() for why the config's own
+                # goal strings are excluded once a live goal is in force.
+                _goal_texts = goal_texts_from_config(config,
+                                                     active_goal=_active_goal)
+
+            # What the model is told the task IS, read now rather than frozen at
+            # load time. `config["ai_context"]` is the pre-run snapshot; after a
+            # goal update it describes work the user has withdrawn, and prompting
+            # the navigator with it is how an agent keeps pursuing a superseded
+            # objective while its own goal record says otherwise.
+            _goal_prompt = _active_goal.statement() or config["ai_context"]
 
             current_url = page.url
             # Bounded in the browser, not after the fact: a huge document is
@@ -7188,6 +8027,7 @@ async def run_pathfinder_agent(config_path="sites_config.json",
             # --- RUNTIME PLAN (only when no explicit steps are configured) ----
             # Built mechanically from the objective plus what is observable on
             # this page, so a one-sentence task needs no hand-written steps.
+            _plan = None
             _plan_proposed = False
             if test_goal is not None and test_goal.is_configured():
                 # Remember this page's elements so unmet_final_evidence_text()
@@ -7328,7 +8168,7 @@ async def run_pathfinder_agent(config_path="sites_config.json",
                         except Exception:
                             _replan_title = None
                     _proposal = ask_ai_planner(
-                        test_goal.objective,
+                        test_goal.goal_statement,
                         _stuck,
                         sorted(_plan._verified.keys()),
                         page_url=current_url,
@@ -7404,43 +8244,81 @@ async def run_pathfinder_agent(config_path="sites_config.json",
                             record_edge_result(_m, True, RESULT_VICTORY_HIT, None)
                             _m["destination"] = "VICTORY"
                 elif current_node == _prev_node_hash:
-                    # Futile action / same-node — heavy penalty
-                    _src = _prev_node_hash
-                    _act = _prev_action
-                    old_cost = 0
-                    if _src is not None and _act is not None:
-                        old_cost = edge_weights.get((_src, _act), 0)
-                        edge_weights[(_src, _act)] = old_cost + FUTILE_ACTION_PENALTY
-                        state_mgr.raise_edge_cost_floor(
-                            _src, _act, FUTILE_ACTION_PENALTY
+                    # Same node. That is NOT on its own proof that nothing
+                    # happened: for a fill, a select or a toggle, the control's
+                    # own value changing IS the effect, and the node hash cannot
+                    # see it because identity is built from the URL and the
+                    # controls' NAMES. Reading same-node as futile is what made
+                    # the engine throw away a correct selection and then act on
+                    # an unrelated control, so the control's value is consulted
+                    # before the action is judged.
+                    _value_moved = None
+                    if (_pending_value_effect is not None
+                            and _prev_action is not None
+                            and _pending_value_effect[0] == pending_transition_seq):
+                        _eff_seq, _eff_op, _eff_before = _pending_value_effect
+                        _after = (observation.record_for(_prev_action) or {}).get(
+                            "value")
+                        _value_moved = control_value_transition(
+                            _eff_op, _eff_before, _after)
+                    if _value_moved is True:
+                        print(f"[StateMgr] Node unchanged, but {_prev_action!r} "
+                              f"changed its own value "
+                              f"({_eff_before!r} -> {_after!r}). Treating this as "
+                              "real progress rather than a futile action.")
+                        state_mgr.record_outcome(
+                            pending_transition_seq,
+                            destination_node_hash=current_node,
+                            outcome="changed_control_value",
+                            last_result_tag=RESULT_SUCCESS_NODE_CHANGED,
+                            cart_delta=0,
+                            form_input_delta=0,
                         )
-                        _m = get_or_create_edge(_src, _act)
-                        if _m is not None:
-                            record_edge_result(_m, False, RESULT_SUCCESS_SAME_NODE,
-                                               destination_node=current_node,
-                                               updated_cost=old_cost + FUTILE_ACTION_PENALTY)
-                    state_mgr.record_outcome(
-                        pending_transition_seq,
-                        destination_node_hash=current_node,
-                        outcome="failed_no_state_change",
-                        last_result_tag=RESULT_SUCCESS_SAME_NODE,
-                        cart_delta=0,
-                        form_input_delta=0,
-                        failure_reason="same_node_hash_after_click",
-                    )
-                    if _act is not None:
-                        print(f"[LoopGuard] Last action '{_act}' produced no state change. "
-                              f"Penalizing: {old_cost} -> {old_cost + FUTILE_ACTION_PENALTY}")
-                        # Route the futile action through the bounded
-                        # controller too. Repeating an action that changed
-                        # nothing is the canonical way a run burns its whole
-                        # budget, so it needs the same audited limit as every
-                        # other failure rather than a cost penalty alone.
-                        _futile_class = classify_failure(
-                            node_changed=False, url_changed=False,
-                            semantic_changed=False)
-                        _handle_recovery(_src, _act, _futile_class,
-                                         tuple(_goal_ctx_now) if _goal_ctx_now else ())
+                        _m_moved = get_or_create_edge(_prev_node_hash, _prev_action)
+                        if _m_moved is not None:
+                            record_edge_result(
+                                _m_moved, True, RESULT_SUCCESS_NODE_CHANGED,
+                                destination_node=current_node)
+                    else:
+                        # Genuinely futile: the node did not move AND either the
+                        # action was not a value change or the control's value
+                        # is observably unchanged. Heavy penalty.
+                        _src = _prev_node_hash
+                        _act = _prev_action
+                        old_cost = 0
+                        if _src is not None and _act is not None:
+                            old_cost = edge_weights.get((_src, _act), 0)
+                            edge_weights[(_src, _act)] = old_cost + FUTILE_ACTION_PENALTY
+                            state_mgr.raise_edge_cost_floor(
+                                _src, _act, FUTILE_ACTION_PENALTY
+                            )
+                            _m = get_or_create_edge(_src, _act)
+                            if _m is not None:
+                                record_edge_result(_m, False, RESULT_SUCCESS_SAME_NODE,
+                                                   destination_node=current_node,
+                                                   updated_cost=old_cost + FUTILE_ACTION_PENALTY)
+                        state_mgr.record_outcome(
+                            pending_transition_seq,
+                            destination_node_hash=current_node,
+                            outcome="failed_no_state_change",
+                            last_result_tag=RESULT_SUCCESS_SAME_NODE,
+                            cart_delta=0,
+                            form_input_delta=0,
+                            failure_reason="same_node_hash_after_click",
+                        )
+                        if _act is not None:
+                            print(f"[LoopGuard] Last action '{_act}' produced no state change. "
+                                  f"Penalizing: {old_cost} -> {old_cost + FUTILE_ACTION_PENALTY}")
+                            # Route the futile action through the bounded
+                            # controller too. Repeating an action that changed
+                            # nothing is the canonical way a run burns its whole
+                            # budget, so it needs the same audited limit as every
+                            # other failure rather than a cost penalty alone.
+                            _futile_class = classify_failure(
+                                node_changed=False, url_changed=False,
+                                semantic_changed=False)
+                            _handle_recovery(_src, _act, _futile_class,
+                                             tuple(_goal_ctx_now) if _goal_ctx_now else ())
                 else:
                     # State actually changed — infer and commit success
                     inferred = RESULT_SUCCESS_NODE_CHANGED
@@ -7812,7 +8690,7 @@ async def run_pathfinder_agent(config_path="sites_config.json",
 
                 decision = ask_ai_navigator(
                     safe_elements,
-                    config["ai_context"],
+                    _goal_prompt,
                     _recent_actions_snapshot,
                     page_url=current_url,
                     page_title=page_title,
@@ -8000,6 +8878,39 @@ async def run_pathfinder_agent(config_path="sites_config.json",
             chosen_final_cost = effective_cost(best_edge)
             print(f"-> Traversing Edge: '{best_edge}' (Path Cost: {chosen_final_cost})")
 
+            # --- GOAL VERSION GUARD -------------------------------------
+            # This decision was produced by a model call made under some goal
+            # version. The user may have replaced or refined the goal since,
+            # and that update can arrive while the call is still in flight.
+            #
+            # The channel is re-read here, at the last point before anything is
+            # recorded or dispatched, so an action conceived under a withdrawn
+            # goal is never written to the ledger and never executed. Placing
+            # it BEFORE record_intent matters: a pending transition the agent
+            # never intended to complete would otherwise be visible in the
+            # state history as an attempted move.
+            _goal_channel.drain_into(_active_goal, test_goal)
+            if _active_goal.version != _goal_version_this_step:
+                print(f"[Goal] Discarding planned action {best_edge!r}: chosen "
+                      f"under goal v{_goal_version_this_step}, active goal is "
+                      f"now v{_active_goal.version} "
+                      f"({_active_goal.objective!r}). Re-planning under the "
+                      "current goal before anything is executed.")
+                _goal_version_this_step = _active_goal.version
+                _goals_discarded_actions += 1
+                # The action is gone; so is everything that chose it. Without
+                # this, the next step reaches the scoring decision still finding
+                # this node in `_scored_nodes` and reuses a ranking computed for
+                # the withdrawn goal — the discarded action would come back under
+                # a new name.
+                _steps_since_progress = 0
+                _stale_decision = None
+                invalidate_goal_scoped_step_state(_scored_nodes,
+                                                 _node_goal_context)
+                _goal_texts = goal_texts_from_config(config,
+                                                     active_goal=_active_goal)
+                continue
+
             # --- STATE MANAGER: record intent (opens pending Transition) ---
             # This is the authoritative write to transition_history. The LLM
             # did NOT touch these structures — its JSON output was pure input
@@ -8029,6 +8940,18 @@ async def run_pathfinder_agent(config_path="sites_config.json",
                 _base_label = observation.base_label(best_edge)
                 _operation = operation_for_record(_target_record)
 
+                # Remember what this control looked like immediately before the
+                # action, so the next step can tell "this changed nothing" from
+                # "this changed something the node hash cannot see". Keyed by
+                # the transition it belongs to, so a cleared or superseded
+                # pending transition can never be read against the wrong
+                # action's before-state.
+                _pending_value_effect = (
+                    pending_transition_seq,
+                    _operation,
+                    (_target_record or {}).get("value"),
+                )
+
                 # A value may only come from a validated, observed-element-keyed
                 # input map. A sensitive field never takes a model-supplied
                 # value: credentials come from the user's configuration or not
@@ -8044,6 +8967,15 @@ async def run_pathfinder_agent(config_path="sites_config.json",
                                   "credentials are configuration-only.")
                     else:
                         _required_input = _cand
+                        if _required_input is None and _operation == OP_SELECT:
+                            _stated = resolve_goal_stated_option(
+                                _target_record.get("options"), _goal_texts)
+                            if _stated is not None:
+                                _required_input = _stated
+                                print(f"[Ground] {best_edge!r} needs a value and "
+                                      "the model supplied none; using the "
+                                      f"option the user's own goal names: "
+                                      f"{_stated!r}")
 
                 _intent = ActionIntent(
                     operation=_operation,
@@ -8340,6 +9272,12 @@ async def run_pathfinder_agent(config_path="sites_config.json",
             "Actions executed": _actions_executed,
             "Actions rejected by grounding gate": _grounding_rejections,
             "Actions rejected by safety policy": _safety_stops,
+            # Goal-update accounting. Zero on every run whose goal never changed,
+            # which is what makes a non-zero value meaningful rather than noise.
+            "Goal version in force at end": _active_goal.version,
+            "Goal updates received": len(_active_goal.updates),
+            "Objectives superseded": len(_active_goal.superseded),
+            "Actions discarded by goal change": _goals_discarded_actions,
         }
 
         # Reporting must never be able to destroy the result it is reporting.
@@ -8413,6 +9351,8 @@ async def run_pathfinder_agent(config_path="sites_config.json",
                 ambiguous_requirements=_ambiguous_requirements,
                 recovery=_recovery.summary(),
                 shadow=(_shadow.summary() if _shadow.enabled else None),
+                goal_updates=_active_goal.report_block(
+                    discarded_actions=_goals_discarded_actions),
             )
         except Exception as report_exc:
             print(f"[Report] WARNING: could not write the run report "
